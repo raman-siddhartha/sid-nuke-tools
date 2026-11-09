@@ -5,6 +5,7 @@ Contents
 --------
 sid_match_tools.py   - Neutralize, Match Black, Match White, Match Colour
 sid_edge_extend.py   - Edge Extend, Alpha Edge, Light Wrap
+sid_edge_extend_blur.py - Edge Extend Blur (Edge Extend + final edge blur)
 menu.py              - registers all of the above under Nodes > Sid
 
 Install
@@ -12,9 +13,9 @@ Install
 1. Copy this whole folder's contents into your Nuke user directory
    (the folder already on NUKE_PATH, usually ~/.nuke), or any folder
    you add to NUKE_PATH.
-2. If you already have a menu.py there, merge the four lines from this
+2. If you already have a menu.py there, merge the six lines from this
    one into it instead of overwriting your existing file.
-3. Restart Nuke. Nodes > Sid will list all seven tools.
+3. Restart Nuke. Nodes > Sid will list all eight tools.
 
 Match Tools (sid_match_tools.py)
 ---------------------------------
@@ -65,3 +66,11 @@ Edge Extend Tools (sid_edge_extend.py)
 
 All three take a Mask input and a Mix slider for standard masked/
 partial application.
+
+Edge Extend Blur (sid_edge_extend_blur.py)
+--------------------------------------------
+A separate copy of Edge Extend (the original is unchanged) with one
+extra control, Edge Blur, applied as the very last step - after Mask
+& Mix. It blurs RGB only, inside a band around the alpha edge; the
+output alpha is never changed and no colour spills outside the matte.
+Edge Blur moves in 0.1 steps; 0 = off.

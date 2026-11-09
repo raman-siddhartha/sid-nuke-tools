@@ -100,14 +100,30 @@ def _sample_plane(node, size, mask_node=None):
     if node is None:
         return []
     w = h = max(8, int(size))
+    # "distort" maps the WHOLE frame onto the proxy box. "fill" either
+    # cropped or letterboxed any non-square plate, so part of the frame
+    # was never sampled and/or black bars were counted as real pixels.
+    # Non-uniform scaling is harmless here: only statistics are read.
     rz = nuke.nodes.Reformat(inputs=[node], type="to box",
                               box_width=w, box_height=h, box_fixed=True,
-                              resize="fill", black_outside=True)
+                              resize="distort", black_outside=True)
     mz = None
+    mask_align = None
     if mask_node is not None:
-        mz = nuke.nodes.Reformat(inputs=[mask_node], type="to box",
+        mask_src = mask_node
+        # A mask in a different format than the plate (e.g. a root-format
+        # Roto over a scope plate) must first be put on the plate's own
+        # pixel grid -- unscaled, origin-anchored, exactly how a Merge would
+        # line it up -- otherwise the two proxies cover different areas.
+        if (mask_node.width(), mask_node.height()) != (node.width(), node.height()):
+            mask_align = nuke.nodes.Reformat(inputs=[mask_node], type="to box",
+                                             box_width=node.width(), box_height=node.height(),
+                                             box_fixed=True, resize="none", center=False,
+                                             black_outside=True)
+            mask_src = mask_align
+        mz = nuke.nodes.Reformat(inputs=[mask_src], type="to box",
                                   box_width=w, box_height=h, box_fixed=True,
-                                  resize="fill", black_outside=True)
+                                  resize="distort", black_outside=True)
     try:
         has_alpha = _has_channel(rz, "alpha")
         # Many mask sources (Roto, etc.) carry only an alpha channel, no
@@ -139,18 +155,47 @@ def _sample_plane(node, size, mask_node=None):
         nuke.delete(rz)
         if mz is not None:
             nuke.delete(mz)
+        if mask_align is not None:
+            nuke.delete(mask_align)
+
+
+def _frame_hold(node, frame):
+    """Temporary FrameHold pinned to `frame`, or None if this Nuke's
+    FrameHold knob name isn't recognised (renamed across versions)."""
+    if node is None:
+        return None
+    fh = nuke.nodes.FrameHold(inputs=[node])
+    for knob_name in ("firstFrame", "first_frame"):
+        k = fh.knob(knob_name)
+        if k is not None:
+            k.setValue(int(frame))
+            return fh
+    nuke.delete(fh)
+    return None
 
 
 def _sample_plane_at_frame(node, size, frame, mask_node=None):
     """Same as `_sample_plane`, but samples at an arbitrary frame instead
-    of the current one -- moves the playhead there, samples, then puts
-    it back exactly where it was."""
-    cur = nuke.frame()
+    of the current one -- through temporary FrameHolds, so the user's
+    playhead and Viewer cache are left alone. Falls back to moving the
+    playhead (and restoring it) only if FrameHold can't be configured."""
+    if node is None:
+        return []
+    fh = _frame_hold(node, frame)
+    if fh is None:
+        cur = nuke.frame()
+        try:
+            nuke.frame(frame)
+            return _sample_plane(node, size, mask_node)
+        finally:
+            nuke.frame(cur)
+    mfh = _frame_hold(mask_node, frame) if mask_node is not None else None
     try:
-        nuke.frame(frame)
-        return _sample_plane(node, size, mask_node)
+        return _sample_plane(fh, size, mfh if mfh is not None else mask_node)
     finally:
-        nuke.frame(cur)
+        nuke.delete(fh)
+        if mfh is not None:
+            nuke.delete(mfh)
 
 
 def _weighted_percentile_anchor(pixels, percent, want_darkest):
@@ -162,7 +207,10 @@ def _weighted_percentile_anchor(pixels, percent, want_darkest):
     seq = by_luma if want_darkest else list(reversed(by_luma))
     acc_w = sum_w = sum_r = sum_g = sum_b = 0.0
     for px in seq:
-        if acc_w >= target_w:
+        # `sum_w > 0` guarantees at least one weighted pixel is taken, so a
+        # 0% setting means "the single darkest/brightest pixel" instead of
+        # breaking immediately and returning black.
+        if acc_w >= target_w and sum_w > 0.0:
             break
         w = px[3]
         acc_w += w
@@ -452,7 +500,20 @@ def _install_live_refresh(group, analyze_fn_name, extra_knobs=(), setref_fn_name
     group["knobChanged"].setValue(script)
     group["inputChange"].setValue(
         "import sid_match_tools as _s\n"
-        "_s.%s(nuke.thisNode(), True)\n" % analyze_fn_name)
+        "_s._on_input_change(nuke.thisNode(), %r)\n" % analyze_fn_name)
+
+
+def _on_input_change(group, analyze_fn_name):
+    """inputChange handler. Respects Mode (it used to force a Live
+    re-sample even in Locked mode, overwriting the locked solve), and
+    skips sampling while the wiring is incomplete: no Source, or Live
+    with no Target (which would solve against an empty target)."""
+    if group.input(0) is None:
+        return
+    live = group["mode"].value() == "Live"
+    if live and group.input(1) is None:
+        return
+    globals()[analyze_fn_name](group, live)
 
 
 # -- Match Black ----------------------------------------------------------
@@ -759,8 +820,25 @@ def _nz_band_weight_terms(luma):
     return terms_w
 
 
+# Per-pixel luma / chroma magnitude are computed ONCE per pixel in the
+# Expression node's temp registers and referenced by name below, instead
+# of being inlined dozens of times into every channel's expression text.
+_LUMA_TEMP = "sLum"
+_CHROMA_TEMP = "sChr"
+_LUMA_EXPR = "0.2126*r+0.7152*g+0.0722*b"
+_CHROMA_EXPR = "sqrt((r-sLum)*(r-sLum)+(g-sLum)*(g-sLum)+(b-sLum)*(b-sLum))"
+
+
+def _set_shared_temps(xform, with_chroma):
+    xform["temp_name0"].setValue(_LUMA_TEMP)
+    xform["temp_expr0"].setValue(_LUMA_EXPR)
+    if with_chroma:
+        xform["temp_name1"].setValue(_CHROMA_TEMP)
+        xform["temp_expr1"].setValue(_CHROMA_EXPR)
+
+
 def _nz_expr_for_channel(ch):
-    luma = "(0.2126*r+0.7152*g+0.0722*b)"
+    luma = _LUMA_TEMP
     terms_w = _nz_band_weight_terms(luma)
     den = "+".join(terms_w) + "+1e-6"
 
@@ -779,7 +857,7 @@ def _nz_expr_for_channel(ch):
     terms_lum = []
     terms_cg = []
     for i, w in enumerate(terms_w):
-        terms_lum.append("(%s)*(parent.a%dR*%s+parent.blum%d)" % (w, i, luma, i))
+        terms_lum.append("(%s)*(parent.alum%d*%s+parent.blum%d)" % (w, i, luma, i))
         terms_cg.append("(%s)*(parent.cg%d)" % (w, i))
     matched_luma = "((%s)/(%s))" % ("+".join(terms_lum), den)
     chroma_scale = "((%s)/(%s))" % ("+".join(terms_cg), den)
@@ -822,6 +900,10 @@ def _nz_analyze(group, use_live_target):
     centers = _band_centers(bands)
     spacing = 1.0 / bands
     group["spacing"].setValue(spacing)
+    # Nodes built by this version carry a dedicated alum{i} luma-gain knob.
+    # Older saved nodes have expressions that read the luma gain from
+    # a{i}R, so for those keep writing it there (previous behaviour).
+    luma_gain_knob = "alum%d" if "alum0" in group.knobs() else "a%dR"
 
     for i in range(MAX_BANDS):
         if i >= bands:
@@ -829,6 +911,7 @@ def _nz_analyze(group, use_live_target):
             for ch in ("R", "G", "B"):
                 group["a%d%s" % (i, ch)].setValue(1.0)
                 group["b%d%s" % (i, ch)].setValue(0.0)
+            group[luma_gain_knob % i].setValue(1.0)
             group["blum%d" % i].setValue(0.0)
             group["cg%d" % i].setValue(1.0)
             continue
@@ -865,9 +948,9 @@ def _nz_analyze(group, use_live_target):
             tgt_luma_std = LUMA_R * tgt_std[0] + LUMA_G * tgt_std[1] + LUMA_B * tgt_std[2]
             luma_gain = max(1e-3, min(1e3, tgt_luma_std / max(src_luma_std, STD_EPS)))
             blum = tgt_luma_mean - luma_gain * src_luma_mean
-            # a{i}R carries the shared luma gain for this band's
-            # matched-luma term in the expression.
-            group["a%dR" % i].setValue(luma_gain)
+            # Own knob (alum{i}) so a{i}R keeps the red channel's real
+            # per-channel gain if Preserve Saturation is later turned off.
+            group[luma_gain_knob % i].setValue(luma_gain)
             group["blum%d" % i].setValue(blum)
             cg = tgt_chroma[i] / max(src_chroma[i], STD_EPS)
             group["cg%d" % i].setValue(max(1e-3, min(1e3, cg)))
@@ -932,6 +1015,8 @@ def _nz_reset(group):
         for nm in ("refMeanR", "refMeanG", "refMeanB", "refStdR", "refStdG", "refStdB",
                     "refChroma"):
             group["%s_%d" % (nm, i)].setValue(0.0)
+        if "alum%d" % i in group.knobs():
+            group["alum%d" % i].setValue(1.0)
         group["blum%d" % i].setValue(0.0)
         group["cg%d" % i].setValue(1.0)
 
@@ -971,6 +1056,7 @@ def make_neutralize():
         hidden_names = ["spacing"]
         for i in range(MAX_BANDS):
             hidden_names.append("center%d" % i)
+            hidden_names.append("alum%d" % i)
             hidden_names.append("blum%d" % i)
             hidden_names.append("cg%d" % i)
             for ch in ("R", "G", "B"):
@@ -991,7 +1077,7 @@ def make_neutralize():
                 k.setValue(1.0)
             elif nm[0] == "a" and nm[1:2].isdigit():
                 k.setValue(1.0)
-            elif nm[:2] == "cg":
+            elif nm[:2] == "cg" or nm.startswith("alum"):
                 k.setValue(1.0)
 
         analyze_btn = nuke.PyScript_Knob(
@@ -1018,6 +1104,7 @@ def make_neutralize():
             group.addKnob(k)
         _add_credit_knob(group)
 
+        _set_shared_temps(xform, with_chroma=False)
         xform["expr0"].setValue(_nz_expr_for_channel("R"))
         xform["expr1"].setValue(_nz_expr_for_channel("G"))
         xform["expr2"].setValue(_nz_expr_for_channel("B"))
@@ -1095,9 +1182,9 @@ def _mc_expr_for_channel(ch):
     transfers the saturation change instead of just surviving it."""
     lo = ch.lower()
     per_channel = _mc_curve_expr(ch, ch, lo)
-    luma = "(0.2126*r+0.7152*g+0.0722*b)"
+    luma = _LUMA_TEMP
     mapped_luma = _mc_curve_expr(ch, "", luma)
-    chroma_cur = "sqrt((r-%s)*(r-%s)+(g-%s)*(g-%s)+(b-%s)*(b-%s))" % ((luma,) * 6)
+    chroma_cur = _CHROMA_TEMP
     mapped_chroma = _mc_curve_expr(ch, "C", chroma_cur)
     chroma_scale = "(%s/max(%s,1e-6))" % (mapped_chroma, chroma_cur)
     shared = "(%s+(%s-%s)*%s)" % (mapped_luma, lo, luma, chroma_scale)
@@ -1303,6 +1390,7 @@ def make_match_colour():
             group.addKnob(k)
         _add_credit_knob(group)
 
+        _set_shared_temps(xform, with_chroma=True)
         xform["expr0"].setValue(_mc_expr_for_channel("R"))
         xform["expr1"].setValue(_mc_expr_for_channel("G"))
         xform["expr2"].setValue(_mc_expr_for_channel("B"))
