@@ -212,7 +212,7 @@ def colour_knob_names(prefix):
 
 def knob_names(eid):
     """Every knob an element owns (for tests and the knob builder)."""
-    names = [eid + "On", eid + "Intensity", eid + "Source", eid + "Tint", eid + "Offset"]
+    names = [eid + "On", eid + "Intensity", eid + "Source", eid + "Tint", eid + "Offset", eid + "OffsetOn"]
     names += [eid + spec[0] for spec in EXTRA[eid]]
     if eid in COLOURED:
         names += colour_knob_names(eid)
@@ -291,9 +291,40 @@ def _gain(eid, name, extra="1", chan=("1", "1", "1")):
 
 
 def offset_tcl(prefix, name):
-    """Art-direct translate (plate px) on an element's final output."""
-    return ("Transform {\n translate {{parent.%sOffset.x*%s} {parent.%sOffset.y*%s}}\n name %s\n}"
-            % (prefix, RES, prefix, RES, name))
+    """Art-direct translate (plate px) on an element's final output; only
+    applied while the element's Use Offset checkbox is on."""
+    return ("Transform {\n translate {{parent.%sOffset.x*%s*parent.%sOffsetOn} "
+            "{parent.%sOffset.y*%s*parent.%sOffsetOn}}\n name %s\n}"
+            % (prefix, RES, prefix, prefix, RES, prefix, name))
+
+
+OFFSET_PREFIXES = ["ghosts", "star"]    # + every element id (see offset_prefixes())
+
+
+def offset_prefixes():
+    return OFFSET_PREFIXES + [eid for eid, _l, _f, _s in ELEMENTS]
+
+
+def offset_knobs(nuke, prefix):
+    """'Use Offset' checkbox + the Offset XY knob. The XY knob (and so its
+    Viewer handle) is hidden until Use Offset is ticked, so the handles of
+    the elements you are not moving don't pile up in the Viewer."""
+    use = nuke.Boolean_Knob(prefix + "OffsetOn", "Use Offset", False)
+    use.setFlag(nuke.STARTLINE)
+    use.setTooltip("Show and apply the Offset for this element only.")
+    off = nuke.XY_Knob(prefix + "Offset", "Offset")
+    off.setValue([0.0, 0.0])
+    off.setTooltip("Art-direct move in plate px, on top of the physical position.")
+    off.setVisible(False)
+    return [use, off]
+
+
+def sync_offset_visibility(group, prefix=None):
+    """Show each Offset XY knob only while its Use Offset is on. Knob
+    visibility is not saved with the script, so this also runs on load."""
+    for pf in ([prefix] if prefix else offset_prefixes()):
+        if pf + "OffsetOn" in group.knobs() and pf + "Offset" in group.knobs():
+            group[pf + "Offset"].setVisible(bool(group[pf + "OffsetOn"].value()))
 
 
 def _centre_temps():
@@ -960,8 +991,6 @@ def add_element_knobs(group, nuke, center_knob=None):
         if eid in COLOURED:
             for k in colour_knobs(nuke, eid):
                 group.addKnob(k)
-        off = nuke.XY_Knob(eid + "Offset", "Offset")
-        off.setValue([0.0, 0.0])
-        off.setTooltip("Art-direct move in plate px, on top of the element's physical position.")
-        group.addKnob(off)
+        for k in offset_knobs(nuke, eid):
+            group.addKnob(k)
         group.addKnob(nuke.Tab_Knob("grp_%s_end" % eid, "", nuke.TABENDGROUP))

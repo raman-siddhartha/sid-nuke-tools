@@ -139,4 +139,6 @@ Lens Flare panel tabs
     Colour Mode Tint / Spectrum (rainbow: violet inside, red outside) /
     Ramp (4 colour stops), Colour Width, Light Colour (1 = take the
     light's colour), Noise + Noise Scale + Noise Speed.
-  Offset moves any element in plate px on top of its physical position.
+  Use Offset (per element, off by default) shows that element's Offset
+  handle and moves it in plate px on top of its physical position; the
+  handles of elements you are not moving stay hidden.

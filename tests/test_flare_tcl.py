@@ -301,6 +301,21 @@ class ElementTests(unittest.TestCase):
         for prefix in ("ghosts", "star"):
             self.assertIn("parent.%sOffset.x" % prefix, self.tcl, prefix)
 
+    def test_offset_only_applied_when_use_offset_is_on(self):
+        for prefix in fe.offset_prefixes():
+            self.assertIn("parent.%sOffset.x*pow(0.5,parent.flareRes)*parent.%sOffsetOn" % (prefix, prefix),
+                          self.tcl, prefix)
+            self.assertIn("parent.%sOffset.y*pow(0.5,parent.flareRes)*parent.%sOffsetOn" % (prefix, prefix),
+                          self.tcl, prefix)
+            names = self.group.names
+            self.assertIn(prefix + "OffsetOn", names, prefix)
+            self.assertEqual(names.index(prefix + "OffsetOn") + 1, names.index(prefix + "Offset"), prefix)
+
+    def test_use_offset_defaults_off(self):
+        for prefix in fe.offset_prefixes():
+            knob = self.group.knobs[self.group.names.index(prefix + "OffsetOn")]
+            self.assertIs(knob.args[-1], False, prefix)
+
     def test_optical_centre_on_elements_tab(self):
         names = self.group.names
         self.assertGreater(names.index("opticalCenter"), names.index("tabElements"))

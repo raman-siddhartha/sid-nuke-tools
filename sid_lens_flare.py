@@ -428,12 +428,6 @@ def _add_knobs(group, width, height):
                          "frame edge and light does not wrap across it. Costs render time: "
                          "25% is about 2.25x the canvas area.")
 
-    def _offset_knob(prefix):
-        k = nuke.XY_Knob(prefix + "Offset", "Offset")
-        k.setValue([0.0, 0.0])
-        k.setTooltip("Art-direct move in plate px, on top of the physical position.")
-        return k
-
     lens_tab = [nuke.Tab_Knob("tabLens", "Lens"),
                 preset_k, custom_k, fstop_k, sensor_k,
                 _divider("divSrc"), _heading("hdrSrc", "Source"), thr_k, knee_k, stops_k,
@@ -443,10 +437,11 @@ def _add_knobs(group, width, height):
     ghosts_tab = ([nuke.Tab_Knob("tabGhosts", "Ghosts & Glare"),
                    ghosts_on, count_k, gint_k, disp_k, coat_k]
                   + elements.colour_knobs(nuke, "ghosts")
-                  + [_offset_knob("ghosts"),
-                     _divider("divStar"), star_on, sint_k, slen_k, sthk_k, sfall_k,
-                     srot_k, schr_k, sirr_k, sseed_k, _offset_knob("star"),
-                     _divider("divGlare"), glare_on, glint_k, glsize_k])
+                  + elements.offset_knobs(nuke, "ghosts")
+                  + [_divider("divStar"), star_on, sint_k, slen_k, sthk_k, sfall_k,
+                     srot_k, schr_k, sirr_k, sseed_k]
+                  + elements.offset_knobs(nuke, "star")
+                  + [_divider("divGlare"), glare_on, glint_k, glsize_k])
     for k in lens_tab + ghosts_tab + hidden:
         group.addKnob(k)
 
@@ -499,6 +494,9 @@ def solve(group):
 
 def _on_knob_changed():
     k = nuke.thisKnob()
+    if k is not None and k.name().endswith("OffsetOn"):
+        elements.sync_offset_visibility(nuke.thisNode(), k.name()[:-len("OffsetOn")])
+        return
     if k is not None and k.name() in SOLVE_KNOBS:
         node = nuke.thisNode()
         try:
@@ -526,6 +524,9 @@ def make_lens_flare():
         nuke.tcl(build_tcl())
     _add_knobs(group, width, height)
     group["knobChanged"].setValue("import sid_lens_flare\nsid_lens_flare._on_knob_changed()\n")
+    # Knob visibility is not saved with the script: re-apply it when the script loads.
+    group["onCreate"].setValue("import sid_flare_elements\n"
+                               "sid_flare_elements.sync_offset_visibility(nuke.thisNode())\n")
     solve(group)
     group["label"].setValue("[value lensPreset]  f/[value effFstop]")
     if selected is not None:

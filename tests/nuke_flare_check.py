@@ -77,6 +77,7 @@ def reset():
         g[eid + "Source"].setValue(src_default)
         g[eid + "Tint"].setValue([1.0, 1.0, 1.0])
         g[eid + "Offset"].setValue([0.0, 0.0])
+        g[eid + "OffsetOn"].setValue(False)
         for suffix, _lab, kind, _lo, _hi, default, _tip in fe.EXTRA[eid]:   # extras back to defaults
             g[eid + suffix].setValue(int(default) if kind != "d" else default)
     for prefix in list(fe.COLOURED) + ["ghosts"]:
@@ -90,6 +91,7 @@ def reset():
             g["%sRampPos%d" % (prefix, i)].setValue(pos)
     for prefix in ("ghosts", "star"):
         g[prefix + "Offset"].setValue([0.0, 0.0])
+        g[prefix + "OffsetOn"].setValue(False)
     g["overscan"].setValue(25.0)
     g["opticalCenter"].setValue([320.0, 180.0])
     g["apRoundness"].setValue(0.1)
@@ -451,6 +453,13 @@ check(ok, "moving Optical Centre moves the Iris to (%.1f, %.1f): %.4g there vs %
 # Offset moves an element by exactly the set amount (plate px).
 elements_only("iris")
 g["irisOffset"].setValue([200.0, 0.0])
+ic = axial(-0.6)
+check(s(*ic) > 1e-3 and abs(s(ic[0] + 200, ic[1])) < 1e-6,
+      "Offset is ignored while Use Offset is off (%.4g at the iris, %.4g at +200px)" % (s(*ic), s(ic[0] + 200, ic[1])))
+check(not g["irisOffset"].visible(), "Offset knob (and its Viewer handle) hidden while Use Offset is off")
+g["irisOffsetOn"].setValue(True)
+check(g["irisOffset"].visible() and not g["caustic" + "Offset"].visible(),
+      "Use Offset shows only that element's Offset knob")
 ic = axial(-0.6)
 moved = s(ic[0] + 200, ic[1])
 left = s(*ic)
