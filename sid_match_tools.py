@@ -237,6 +237,10 @@ def _solve_two_point(pivot, anchor_src, anchor_tgt):
 def _add_credit_knob(group):
     group.addKnob(nuke.Text_Knob("creditDivider", "", ""))   # empty label+value = a real divider rule
     group.addKnob(nuke.Text_Knob("credit", "", "Made by Sid (www.sidmanvfx.com)"))
+    import base64
+    sig = nuke.Text_Knob("_sig", "", base64.b64decode("TWFkZSBieSBTaWQgKHd3dy5zaWRtYW52ZnguY29tKQ==").decode("ascii"))
+    sig.setFlag(nuke.INVISIBLE)
+    group.addKnob(sig)
 
 
 def _hidden_double_knobs(names):

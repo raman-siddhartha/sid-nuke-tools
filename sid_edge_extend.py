@@ -26,6 +26,10 @@ def _section_heading(name, label):
 def _add_credit_knob(group):
     group.addKnob(_divider("creditDivider"))
     group.addKnob(nuke.Text_Knob("credit", "", "<span style='color:#777; font-size:11px;'>Made by Sid (www.sidmanvfx.com)</span>"))
+    import base64
+    sig = nuke.Text_Knob("_sig", "", base64.b64decode("TWFkZSBieSBTaWQgKHd3dy5zaWRtYW52ZnguY29tKQ==").decode("ascii"))
+    sig.setFlag(nuke.INVISIBLE)
+    group.addKnob(sig)
 
 
 def _set_knob_tcl(node_name, knob_name, val_str):
