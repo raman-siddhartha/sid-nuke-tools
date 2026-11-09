@@ -76,6 +76,23 @@ def reset():
         g[eid + "Intensity"].setValue(fe.DEFAULT_INTENSITY[eid])
         g[eid + "Source"].setValue(src_default)
         g[eid + "Tint"].setValue([1.0, 1.0, 1.0])
+        g[eid + "Offset"].setValue([0.0, 0.0])
+        for suffix, _lab, kind, _lo, _hi, default, _tip in fe.EXTRA[eid]:   # extras back to defaults
+            g[eid + suffix].setValue(int(default) if kind != "d" else default)
+    for prefix in list(fe.COLOURED) + ["ghosts"]:
+        g[prefix + "ColorMode"].setValue(0)
+        g[prefix + "Noise"].setValue(0.0)
+        g[prefix + "NoiseSpeed"].setValue(0.0)
+        g[prefix + "LightColor"].setValue(1.0)
+        g[prefix + "ColorWidth"].setValue(1.0 if prefix in fe.RING_TYPES else 0.35)
+        for i, (col, pos) in enumerate(fe.RAMP_DEFAULTS):
+            g["%sRamp%d" % (prefix, i)].setValue(list(col))
+            g["%sRampPos%d" % (prefix, i)].setValue(pos)
+    for prefix in ("ghosts", "star"):
+        g[prefix + "Offset"].setValue([0.0, 0.0])
+    g["overscan"].setValue(25.0)
+    g["opticalCenter"].setValue([320.0, 180.0])
+    g["apRoundness"].setValue(0.1)
     lf.solve(g)
 
 
@@ -290,9 +307,9 @@ def elements_only(eid):
 elements_only(None)
 check(grid_max() == 0.0, "everything off (ghosts/star/glare switches + all elements) gives black")
 
-hoop_dir = (P[0] - C[0], P[1] - C[1])
-hoop_n = math.hypot(*hoop_dir)
-hoop_r = 0.45 * 360
+ring_dir = (P[0] - C[0], P[1] - C[1])
+ring_n = math.hypot(*ring_dir)
+ring_r = 0.45 * 360
 EXPECT = {
     # eid: (bright point value, control value, description)
     "streak": (lambda: s(P[0] + 60, P[1]), lambda: s(P[0], P[1] + 60), "along the streak vs across it"),
@@ -306,9 +323,10 @@ EXPECT = {
     "rings": (lambda: s(axial(-0.9)[0] + 120, axial(-0.9)[1]), lambda: s(*axial(-0.9)), "on the ring vs its centre"),
     "caustic": (lambda: s(axial(-0.3)[0] + 80, axial(-0.3)[1]), lambda: s(*axial(-0.3)),
                 "bright edge vs dim centre"),
-    "hoop": (lambda: s(C[0] + hoop_r * hoop_dir[0] / hoop_n, C[1] + hoop_r * hoop_dir[1] / hoop_n),
-             lambda: s(C[0] - hoop_r * hoop_dir[0] / hoop_n, C[1] - hoop_r * hoop_dir[1] / hoop_n),
-             "arc facing the light vs opposite arc"),
+    "ringHalo": (lambda: s(C[0] + ring_r * ring_dir[0] / ring_n, C[1] + ring_r * ring_dir[1] / ring_n),
+                 lambda: s(*C), "orbital ring (arc facing the light) vs the optical centre"),
+    "bloom": (lambda: s(P[0] + 15, P[1]), lambda: s(5, 5), "glow next to the light vs far corner"),
+    "wash": (lambda: s(5, 5), lambda: 0.0, "far corner is lifted"),
     "orbs": (lambda: sum(s(x, y) for x in range(330, 640, 10) for y in range(180, 360, 10)),
              lambda: sum(s(x, y) for x in range(0, 310, 10) for y in range(0, 180, 10)),
              "quadrant near the light vs far quadrant"),
@@ -404,6 +422,125 @@ for eid, _l, _f, _s in fe.ELEMENTS:
     check(all(math.isfinite(v) for v in vals) and any(v != 0.0 for v in vals),
           "%s at slider maxima: finite and not all zero (max %.4g)" % (eid, max(vals)))
 
+# -- v3: overscan, optical centre, offset, ring colour, ring/halo, bloom, wash ----
+
+# Overscan: a large Iris is capped by the kernel canvas without overscan
+# (Half res canvas 320x180 -> radius cap 86 working px = 172 plate px) but not
+# with 25% (cap 131 working px). Size 200 plate px at f/2.8: a point 185 plate
+# px from the iris centre is inside the shape only when not capped.
+elements_only("iris")
+g["irisSize"].setValue(200.0)
+ic = axial(-0.6)
+probe = (ic[0] + 185, ic[1])
+g["overscan"].setValue(0.0)
+os0 = s(*probe)
+g["overscan"].setValue(25.0)
+os25 = s(*probe)
+check(os25 > 1e-4 and os25 > 10 * abs(os0),
+      "Overscan 25 keeps a large Iris uncropped (185px from centre: %.4g with overscan vs %.4g without)" % (os25, os0))
+
+# Optical centre at Overscan 25: the Iris follows c + Position*(p - c).
+elements_only("iris")
+g["opticalCenter"].setValue([200.0, 100.0])
+c2 = (200.0, 100.0)
+pred = (c2[0] - 0.6 * (P[0] - c2[0]), c2[1] - 0.6 * (P[1] - c2[1]))
+ok = s(*pred) > 1e-3 and s(*pred) > 5 * abs(s(*axial(-0.6)))
+check(ok, "moving Optical Centre moves the Iris to (%.1f, %.1f): %.4g there vs %.4g at the old spot"
+      % (pred[0], pred[1], s(*pred), s(*axial(-0.6))))
+
+# Offset moves an element by exactly the set amount (plate px).
+elements_only("iris")
+g["irisOffset"].setValue([200.0, 0.0])
+ic = axial(-0.6)
+moved = s(ic[0] + 200, ic[1])
+left = s(*ic)
+check(moved > 1e-3 and moved > 5 * abs(left), "Iris Offset (200, 0): %.4g at +200px vs %.4g at the old spot" % (moved, left))
+
+# Ring colour system on a Ring: Spectrum puts red outside, violet/blue inside.
+def ring_pts():
+    rc = axial(-0.9)
+    return rc, 120.0
+
+
+def rb(pt):
+    return s(pt[0], pt[1], "r") / max(s(pt[0], pt[1], "b"), 1e-12)
+
+
+elements_only("rings")
+g["ringsCount"].setValue(1)
+g["ringsThickness"].setValue(20.0)
+g["ringsColorWidth"].setValue(1.0)
+rc, rr = ring_pts()
+inner, outer = (rc[0] + rr - 8, rc[1]), (rc[0] + rr + 8, rc[1])
+g["ringsColorMode"].setValue(1)
+check(rb(outer) > 1.5 * rb(inner), "Spectrum: ring outside redder than inside (r/b %.3g vs %.3g)" % (rb(outer), rb(inner)))
+g["ringsColorMode"].setValue(2)
+check(rb(inner) > 1.5 * rb(outer), "Ramp (default red inside -> blue outside): r/b inside %.3g vs outside %.3g"
+      % (rb(inner), rb(outer)))
+g["ringsColorMode"].setValue(0)
+check(abs(rb(outer) - rb(inner)) < 0.05 * max(rb(outer), 1e-9), "Tint: ring colour uniform across its width")
+
+# Noise breaks up brightness around the ring; Speed animates it.
+def around():
+    pts = [(rc[0] + rr * math.cos(i * math.pi / 12), rc[1] + rr * math.sin(i * math.pi / 12)) for i in range(24)]
+    return [s(x, y) for x, y in pts if 1 <= x < 639 and 1 <= y < 359]
+
+
+vals = [v for v in around() if 0 <= v]
+flat = max(vals) / max(min(vals), 1e-12)
+g["ringsNoise"].setValue(1.0)
+vals = around()
+bumpy = max(vals) / max(min(vals), 1e-12)
+check(bumpy > 1.5 * flat, "Noise varies brightness around the ring (max/min %.3g vs %.3g without)" % (bumpy, flat))
+g["ringsNoiseSpeed"].setValue(2.0)
+pt = (rc[0] + rr, rc[1])
+nuke.frame(1)
+n1 = s(*pt)
+nuke.frame(5)
+n5 = s(*pt)
+g["ringsNoiseSpeed"].setValue(0.0)
+z5 = s(*pt)
+nuke.frame(1)
+z1 = s(*pt)
+check(abs(n1 - n5) > 1e-6 * max(n1, 1e-9) and z1 == z5, "Noise Speed animates (%.4g -> %.4g), still at 0" % (n1, n5))
+
+# Ring / Halo: Arc 1 makes the facing arc dominate more than Arc 0.
+def arc_ratio():
+    a = s(C[0] + ring_r * ring_dir[0] / ring_n, C[1] + ring_r * ring_dir[1] / ring_n)
+    b = s(C[0] - ring_r * ring_dir[0] / ring_n, C[1] - ring_r * ring_dir[1] / ring_n)
+    return a / max(b, 1e-12)
+
+
+elements_only("ringHalo")
+g["ringHaloArc"].setValue(0.0)
+even = arc_ratio()
+g["ringHaloArc"].setValue(1.0)
+facing = arc_ratio()
+check(facing > 1.5 * even, "Ring/Halo Arc 1 vs 0: facing/opposite %.3g vs %.3g" % (facing, even))
+
+# Ring / Halo in Light mode: a halo ring around the light itself.
+elements_only("ringHalo")
+g["ringHaloCentre"].setValue(1)
+on_ring = s(P[0] - ring_r, P[1])
+gap = s(P[0] - ring_r / 2, P[1])
+check(on_ring > 1e-6 and on_ring > 3 * abs(gap), "Ring/Halo Light mode: ring around the light (%.4g on ring vs %.4g inside)"
+      % (on_ring, gap))
+
+# Wash: Bias 0 is near even over the frame, Bias 1 concentrates toward the light;
+# more light in frame -> more wash.
+elements_only("wash")
+near, far = (P[0] - 20, P[1] - 20), (5, 5)
+g["washBias"].setValue(0.0)
+r0 = s(*near) / max(s(*far), 1e-12)
+w_far = s(*far)
+g["washBias"].setValue(1.0)
+r1 = s(*near) / max(s(*far), 1e-12)
+check(r0 < 3 and r1 > 2 * r0, "Wash Bias 0 near-even (near/far %.3g), Bias 1 toward the light (%.3g)" % (r0, r1))
+g["washBias"].setValue(0.0)
+g["sourceStops"].setValue(13.0)
+check(s(*far) > 1.8 * w_far, "Wash doubles when the light doubles (%.4g -> %.4g)" % (w_far, s(*far)))
+g["sourceStops"].setValue(12.0)
+
 # Hotspot: two separated lights -> exactly two hotspot pixels, at the light centres.
 src["expr0"].setValue("hypot(x+0.5-160.5,y+0.5-90.5)<6?5:(hypot(x+0.5-480.5,y+0.5-250.5)<10?3:r)")
 src["expr1"].setValue("hypot(x+0.5-160.5,y+0.5-90.5)<6?5:(hypot(x+0.5-480.5,y+0.5-250.5)<10?3:g)")
@@ -413,9 +550,11 @@ with g:
     hot = nuke.toNode("hotspot")
 check(hot is not None, "hotspot node found")
 if hot is not None:
-    hw, hh = hot.width(), hot.height()       # working (half) resolution
+    hw, hh = hot.width(), hot.height()       # working (half) resolution, overscan-padded canvas
+    padx, pady = (hw - 320) // 2, (hh - 180) // 2   # 25% overscan pad at Half res (80, 45)
     peaks = [(x, y) for x in range(hw) for y in range(hh) if nuke.sample(hot, "g", x + 0.5, y + 0.5) > 0]
-    near = all(min(math.hypot(2 * (x + 0.5) - lx, 2 * (y + 0.5) - ly) for lx, ly in ((160.5, 90.5), (480.5, 250.5))) < 4
+    near = all(min(math.hypot(2 * (x - padx + 0.5) - lx, 2 * (y - pady + 0.5) - ly)
+                   for lx, ly in ((160.5, 90.5), (480.5, 250.5))) < 4
                for x, y in peaks)
     check(len(peaks) == 2 and near, "two lights (one clipped flat) -> exactly 2 hotspots at their centres: %s" % peaks)
     # Energy: each hotspot pixel carries its light's box-summed energy, so the sum over
@@ -431,12 +570,180 @@ if hot is not None:
         src[ch].setValue("hypot(x+0.5-%s,y+0.5-%s)<30?3:%s" % (DX, DY, "rgb"[int(ch[-1])]))
     elements_only("glint")
     big = [(x, y) for x in range(hw) for y in range(hh) if nuke.sample(hot, "g", x + 0.5, y + 0.5) > 0]
-    big_near = all(math.hypot(2 * (x + 0.5) - DX, 2 * (y + 0.5) - DY) <= 3 for x, y in big)
+    big_near = all(math.hypot(2 * (x - padx + 0.5) - DX, 2 * (y - pady + 0.5) - DY) <= 3 for x, y in big)
     check(len(big) == 1 and big_near, "big clipped disc (radius 30) -> exactly 1 hotspot within 3px of its centre: %s" % big)
 
 # Restore the single-light source for anything that follows.
 for ch, c in (("expr0", "r"), ("expr1", "g"), ("expr2", "b")):
     src[ch].setValue("hypot(x+0.5-%s,y+0.5-%s)<6?%s:%s" % (SRC_X, SRC_Y, SRC_V, c))
+
+# Ramp with stops red (0), green (0.33), blue (0.66), white (1) across a thick
+# ring: inner side red, middle green/blue, outer side blue/white.
+reset()
+elements_only("rings")
+g["ringsCount"].setValue(1)
+g["ringsThickness"].setValue(20.0)
+g["ringsColorWidth"].setValue(1.0)
+g["ringsColorMode"].setValue(2)
+for i, (col, pos) in enumerate((([1, 0, 0], 0.0), ([0, 1, 0], 0.33), ([0, 0, 1], 0.66), ([1, 1, 1], 1.0))):
+    g["ringsRamp%d" % i].setValue(col)
+    g["ringsRampPos%d" % i].setValue(pos)
+rc = axial(-0.9)
+rr = 120.0
+
+
+def rgb_at(dx):
+    return [s(rc[0] + rr + dx, rc[1], ch) for ch in "rgb"]
+
+
+inner_c, mid_c, outer_c = rgb_at(-15.3), rgb_at(0.0), rgb_at(11.4)   # u ~ 0.05, 0.5, 0.83
+check(inner_c[0] > inner_c[1] and inner_c[0] > inner_c[2]
+      and (mid_c[1] + mid_c[2]) / 2 > mid_c[0]
+      and outer_c[2] > outer_c[0],
+      "Ramp stops red/green/blue/white: inner %s, middle %s, outer %s"
+      % ([round(v, 4) for v in inner_c], [round(v, 4) for v in mid_c], [round(v, 4) for v in outer_c]))
+
+# FFT wrap: a large Iris on a light near the right edge must not leak onto the
+# left edge (with Overscan 25; the Overscan 0 value is printed for reference).
+for i in range(3):
+    src["expr%d" % i].setValue("hypot(x+0.5-620.5,y+0.5-250.5)<6?5:%s" % "rgb"[i])
+elements_only("iris")
+g["irisPosition"].setValue(1.0)
+g["irisSize"].setValue(150.0)
+left = (8, 250)
+g["overscan"].setValue(0.0)
+wrap0 = s(*left)
+g["overscan"].setValue(25.0)
+wrap25 = s(*left)
+check(abs(wrap25) < 1e-6 and s(600, 250) > 1e-4,
+      "no FFT wrap to the opposite edge with Overscan 25 (left edge %.3g; %.3g at Overscan 0)" % (wrap25, wrap0))
+
+# Light Colour: a red light gives a red Iris at 1 and a neutral Iris at 0.
+for i in range(3):
+    src["expr%d" % i].setValue("hypot(x+0.5-480.5,y+0.5-250.5)<6?%s:%s" % ("5" if i == 0 else "0", "rgb"[i]))
+elements_only("iris")
+ip = axial(-0.6)
+g["irisLightColor"].setValue(1.0)
+red_ratio = s(ip[0], ip[1], "g") / max(s(ip[0], ip[1], "r"), 1e-12)
+g["irisLightColor"].setValue(0.0)
+grey_ratio = s(ip[0], ip[1], "g") / max(s(ip[0], ip[1], "r"), 1e-12)
+check(red_ratio < 0.05 and grey_ratio > 0.9,
+      "Light Colour: red light -> red Iris at 1 (g/r %.3g), neutral at 0 (g/r %.3g)" % (red_ratio, grey_ratio))
+
+# -- v3 review fixes ---------------------------------------------------------------
+for ch, c in (("expr0", "r"), ("expr1", "g"), ("expr2", "b")):
+    src[ch].setValue("hypot(x+0.5-%s,y+0.5-%s)<6?%s:%s" % (SRC_X, SRC_Y, SRC_V, c))
+
+
+def set_ramp(prefix, cols, poss=(0.0, 0.33, 0.66, 1.0)):
+    for i, (col, pos) in enumerate(zip(cols, poss)):
+        g["%sRamp%d" % (prefix, i)].setValue(list(col))
+        g["%sRampPos%d" % (prefix, i)].setValue(pos)
+
+
+def default_ramp(prefix):
+    set_ramp(prefix, [c for c, _p in fe.RAMP_DEFAULTS], [p for _c, p in fe.RAMP_DEFAULTS])
+
+
+def finite_zero(v):
+    return math.isfinite(v) and abs(v) < 1e-6
+
+
+# Zero-sum colour kernels: a pure-red ramp has an all-zero green/blue kernel;
+# the centre floor keeps those channels finite and the balance (0) blacks them.
+RED4 = [[1, 0, 0]] * 4
+elements_only("rings")
+g["ringsCount"].setValue(1)
+g["ringsColorMode"].setValue(2)
+set_ramp("rings", RED4)
+rc = axial(-0.9)
+on = (rc[0] + 120.0, rc[1])
+rv, gv, bv = [s(on[0], on[1], c) for c in "rgb"]
+check(rv > 0 and finite_zero(gv) and finite_zero(bv),
+      "Rings pure-red ramp: r %.4g > 0, g %.3g, b %.3g finite and 0" % (rv, gv, bv))
+default_ramp("rings")
+
+elements_only("iris")
+g["irisColorMode"].setValue(2)
+g["irisColorWidth"].setValue(1.0)
+set_ramp("iris", RED4)
+ip = axial(-0.6)
+pts = [ip, (ip[0] + 30, ip[1]), (ip[0], ip[1] + 50)]
+vals = [[s(x, y, c) for c in "rgb"] for x, y in pts]
+check(all(v[0] > 0 for v in vals[:2]) and all(finite_zero(v[1]) and finite_zero(v[2]) for v in vals),
+      "Iris pure-red ramp at Colour Width 1: g, b finite and 0 (%s)" % [[round(c, 6) for c in v] for v in vals])
+default_ramp("iris")
+
+# Balance = kernel-weighted mean colour: inside the white core the Iris stays neutral.
+for mode, label in ((2, "Ramp"), (1, "Spectrum")):
+    elements_only("iris")
+    g["irisColorMode"].setValue(mode)
+    rgbc = [s(ip[0], ip[1], c) for c in "rgb"]
+    ratio = max(rgbc) / max(min(rgbc), 1e-12)
+    check(min(rgbc) > 0 and ratio < 1.1, "%s Iris centre (white core) neutral: rgb %s, max/min %.3f"
+          % (label, [round(c, 4) for c in rgbc], ratio))
+    elements_only("caustic")
+    g["causticColorMode"].setValue(mode)
+    cc = axial(-0.3)
+    rgbc = [s(cc[0], cc[1], c) for c in "rgb"]
+    ratio = max(rgbc) / max(min(rgbc), 1e-12)
+    check(min(rgbc) > 0 and ratio < 1.1, "%s Caustic centre (white core) neutral: rgb %s, max/min %.3f"
+          % (label, [round(c, 4) for c in rgbc], ratio))
+    # Aperture extremes (default Colour Width): a triangle's inscribed radius
+    # (0.5 R) lies inside the white core, 12 blades are near round; roundness 0 / 1.
+    for blades, roundness in ((3, 0.0), (3, 1.0), (12, 0.0), (12, 1.0)):
+        elements_only("iris")
+        g["irisColorMode"].setValue(mode)
+        g["blades"].setValue(blades)
+        g["apRoundness"].setValue(roundness)
+        rgbc = [s(ip[0], ip[1], c) for c in "rgb"]
+        ratio = max(rgbc) / max(min(rgbc), 1e-12)
+        check(min(rgbc) > 0 and ratio < 1.1, "%s Iris centre neutral at %d blades, roundness %g: rgb %s, max/min %.3f"
+              % (label, blades, roundness, [round(c, 4) for c in rgbc], ratio))
+    g["apRoundness"].setValue(0.1)
+
+# Ring/Halo Optical Centre mode colours per pixel: no balance in the gain. With
+# all stops (0, 0.5, 0) green must be 0.5 x Tint; applying the colour twice
+# (per pixel and again as a gain balance) would give ~0.25.
+face = (C[0] + ring_r * ring_dir[0] / ring_n, C[1] + ring_r * ring_dir[1] / ring_n)
+elements_only("ringHalo")
+tint_g = s(face[0], face[1], "g")
+g["ringHaloColorMode"].setValue(2)
+set_ramp("ringHalo", [[0, 0.5, 0]] * 4)
+rv, gv, bv = [s(face[0], face[1], c) for c in "rgb"]
+check(gv > 0 and finite_zero(rv) and finite_zero(bv) and 0.4 < gv / max(tint_g, 1e-12) < 0.6,
+      "Ring/Halo Optical Centre ramp (0, 0.5, 0): g %.4g = %.3f x Tint %.4g, r %.3g, b %.3g"
+      % (gv, gv / max(tint_g, 1e-12), tint_g, rv, bv))
+default_ramp("ringHalo")
+
+# Even fields use a fixed reference: Wash at Bias 0 does not depend on Spread.
+elements_only("wash")
+g["washBias"].setValue(0.0)
+g["washSpread"].setValue(100.0)
+w100 = s(5, 5)
+g["washSpread"].setValue(3000.0)
+w3000 = s(5, 5)
+check(w100 > 0 and abs(w100 - w3000) / w100 < 0.01,
+      "Wash Bias 0 independent of Spread: far corner %.5g (Spread 100) vs %.5g (Spread 3000)" % (w100, w3000))
+
+# Ring/Halo Arc 0: the even field does not depend on Arc Falloff.
+elements_only("ringHalo")
+g["ringHaloArc"].setValue(0.0)
+back = (C[0] - ring_r * ring_dir[0] / ring_n, C[1] - ring_r * ring_dir[1] / ring_n)
+g["ringHaloArcFalloff"].setValue(100.0)
+e100 = s(*back)
+g["ringHaloArcFalloff"].setValue(3000.0)
+e3000 = s(*back)
+check(e100 > 0 and abs(e100 - e3000) / e100 < 0.01,
+      "Ring/Halo Arc 0 independent of Arc Falloff: %.5g vs %.5g" % (e100, e3000))
+
+# Output bbox is clamped to the frame (overscan does not leak).
+reset()
+g["outputMode"].setValue("Flare Only")
+bb = g.bbox()
+bb = (bb.x(), bb.y(), bb.w(), bb.h())
+check(bb[0] >= 0 and bb[1] >= 0 and bb[0] + bb[2] <= 640 and bb[1] + bb[3] <= 360,
+      "Flare Only bbox inside the 640x360 format: x, y, w, h = %s" % (bb,))
 
 print("\n%d failure(s)" % len(FAILS))
 sys.exit(1 if FAILS else 0)

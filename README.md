@@ -102,30 +102,41 @@ even n gives n spikes, odd n gives 2n) and veiling glare.
          Nuke17.1.exe --nc -t tests/nuke_flare_check.py   (inside Nuke)
 
 Lens Flare panel tabs
-- Lens: lens, F-Stop, sensor, optical centre, source threshold/gain,
-  aperture, output.
+- Lens: lens, F-Stop, sensor, source threshold/gain, aperture, output.
+  Overscan % (default 25) pads the working canvas so shapes are not
+  cropped at the frame edge and light does not wrap across it.
 - Ghosts & Glare: Ghosts, Starburst and Veiling Glare, each with its
   own on/off switch. Starburst shape: Length (plate px at f/4, no
   minimum), Thickness, Falloff (1 soft tail, 2 Gaussian, higher = hard
   needle), Rotation, Chromatic Spread, Irregularity + Seed.
-- Elements: eleven extra elements, all off by default. Each has Enable,
-  Intensity, Tint and Source:
+- Elements: Optical Centre, Hotspot Radius, then the elements, all off
+  by default. Each has Enable, Intensity, Tint, Offset and Source:
     All highlights - every bright pixel drives the element.
     Hotspot        - one point per light (found every frame with native
-                     nodes; Hotspot Radius sets how close two lights can
-                     be before they merge). Keeps rays crisp on big lights.
-  Centred on each light (default Source: Hotspot):
+                     nodes; set Hotspot Radius to at least the radius of
+                     your biggest light). Keeps rays crisp on big lights.
+  Centred on each light (they follow the light, not the optical centre):
     Streak      anamorphic streak (Length, Thickness, Angle, Falloff)
     Spike Ball  many thin random rays (Rays, Length, Variation, Seed)
     Shimmer     flickering fine rays (Rays, Length, Speed, Seed)
     Sparkle     small twinkling star (Points 4/6/8, Size, Twinkle Speed)
     Glint       intense core + cross spikes (Size, Spike Length, Angle)
-  Along the flare axis (Position: 1 = at the light, 0 = optical centre,
-  -1 = mirror point; default Source: All highlights):
+    Bloom       soft multi-scale glow (Size, Falloff)
+  Along the flare axis (move with both the light and the Optical Centre;
+  Position: 1 = at the light, 0 = optical centre, -1 = mirror point):
     Iris        one aperture-shaped ghost (follows Blades/Roundness)
     Multi-Iris  up to 8 aperture ghosts spread along the axis
     Rings       up to 4 thin circular ghosts
     Caustic     ghost with a bright cusped edge
-  Lit by nearby light (no transform):
-    Hoop        ring around the optical centre, brightest facing the light
-    Lens Orbs   dust on the front glass that lights up near a light
+  Ring / Halo (Rainbow Ring, Ring / Halo, Orbis / Orbital flare):
+    Centre = Optical Centre: a ring around the optical centre, lit from
+    the side facing the light (Arc 0 = evenly lit, 1 = facing arc only).
+    Centre = Light: a halo ring around each light.
+  Fixed to the glass / frame:
+    Lens Orbs        dust on the front glass that lights up near a light
+    Overscreen Wash  frame-wide veil that lifts the blacks (Spread, Bias)
+  Ring colour (Ghosts, Iris, Multi-Iris, Rings, Caustic, Ring / Halo):
+    Colour Mode Tint / Spectrum (rainbow: violet inside, red outside) /
+    Ramp (4 colour stops), Colour Width, Light Colour (1 = take the
+    light's colour), Noise + Noise Scale + Noise Speed.
+  Offset moves any element in plate px on top of its physical position.

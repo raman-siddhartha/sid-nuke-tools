@@ -26,15 +26,15 @@ class TclTests(unittest.TestCase):
 
     def test_every_slot_built_and_gated(self):
         for n in range(lf.SLOTS):
-            self.assertIn("name g%dConv" % n, self.tcl)
+            self.assertIn("name g%dMono" % n, self.tcl)
             self.assertIn("{{parent.ghostCount<=%d||!parent.ghostsOn}}" % n, self.tcl)
             self.assertIn("(parent.ghostCount>%d)*parent.ghostIntensity" % n, self.tcl)
 
     def test_gain_nodes_never_disabled(self):
         # A disabled gain node would pass its unscaled input straight into the sum.
         element_gains = ["%sGain" % eid for eid, _l, _f, _s in fe.ELEMENTS if eid not in ("multiIris", "rings")]
-        element_gains += ["multiIrisGain%d" % i for i in range(fe.MULTI_IRIS_SLOTS)]
-        element_gains += ["ringsGain%d" % i for i in range(fe.RING_SLOTS)]
+        element_gains += ["multiIris%dGain" % i for i in range(fe.MULTI_IRIS_SLOTS)]
+        element_gains += ["rings%dGain" % i for i in range(fe.RING_SLOTS)]
         for name in ["starGain", "glareGain"] + ["g%dGain" % n for n in range(lf.SLOTS)] + element_gains:
             block = re.search(r"Expression \{[^{}]*(?:\{[^{}]*\}[^{}]*)*name %s\b" % name, self.tcl)
             self.assertIsNotNone(block, name)
@@ -256,8 +256,8 @@ class ElementTests(unittest.TestCase):
     def test_every_kernel_has_centre_floor(self):
         names = ["streakKernel", "spikeBallKernel", "shimmerKernel", "sparkleKernel", "glintKernel",
                  "irisKernel", "causticKernel"]
-        names += ["multiIrisKernel%d" % i for i in range(fe.MULTI_IRIS_SLOTS)]
-        names += ["ringsKernel%d" % i for i in range(fe.RING_SLOTS)]
+        names += ["multiIris%dKernel" % i for i in range(fe.MULTI_IRIS_SLOTS)]
+        names += ["rings%dKernel" % i for i in range(fe.RING_SLOTS)]
         for name in names:
             end = self.tcl.index("name %s\n" % name)
             block = self.tcl[self.tcl.rindex("Expression {", 0, end):end]
@@ -270,11 +270,172 @@ class ElementTests(unittest.TestCase):
         for b in blocks:
             self.assertIn("\n disable ", b, b)
 
+    def test_coloured_elements_have_both_branches(self):
+        # Tint = one alpha Convolve2, Spectrum/Ramp = one per channel; a Switch on Colour Mode picks.
+        for prefix in list(fe.COLOURED) + ["ghosts"]:
+            self.assertIn("which {{parent.%sColorMode>0}}" % prefix, self.tcl, prefix)
+            self.assertIn("parent.%sColorMode>0}}" % prefix, self.tcl, prefix)     # mono branch off in colour modes
+            self.assertIn("parent.%sColorMode==0}}" % prefix, self.tcl, prefix)    # colour branch off in Tint
+        for tag in ["iris", "caustic", "ringHaloHalo"] + ["g%d" % n for n in range(lf.SLOTS)]:
+            for ch in ("red", "green", "blue"):
+                self.assertIn("name %s_%s" % (tag, ch), self.tcl, tag)
+
+    def test_overscan_pad_and_crop(self):
+        self.assertIn("name overscanPad", self.tcl)
+        self.assertIn("name overscanGrow", self.tcl)
+        self.assertIn("name overscanCrop", self.tcl)
+        self.assertLess(self.tcl.index("name overscanPad"), self.tcl.index("name g0Aperture"))
+        self.assertGreater(self.tcl.index("name overscanCrop"), self.tcl.index("set el_wash"))
+        self.assertLess(self.tcl.index("name overscanCrop"), self.tcl.index("name flareUp"))
+
+    def test_optical_centre_always_padded(self):
+        # Positions scale by the real working/plate ratio (flareDown/highlights), then add the pad.
+        uses = re.findall(r"parent\.opticalCenter\.[xy]\*flareDown\.(?:width|height)/highlights\.(?:width|height)"
+                          r"(\+floor)?", self.tcl)
+        self.assertTrue(uses)
+        self.assertTrue(all(uses), "an opticalCenter use lacks the overscan pad")
+
+    def test_every_element_has_offset(self):
+        for eid, _l, _f, _s in fe.ELEMENTS:
+            self.assertIn("parent.%sOffset.x" % eid, self.tcl, eid)
+        for prefix in ("ghosts", "star"):
+            self.assertIn("parent.%sOffset.x" % prefix, self.tcl, prefix)
+
+    def test_optical_centre_on_elements_tab(self):
+        names = self.group.names
+        self.assertGreater(names.index("opticalCenter"), names.index("tabElements"))
+        self.assertLess(names.index("overscan"), names.index("tabGhosts"))
+
     def test_hotspot_only_runs_when_used(self):
         end = self.tcl.index("name hotSmooth")
         block = self.tcl[self.tcl.rindex("Blur {", 0, end):end]
         for eid, _l, _f, _s in fe.ELEMENTS:
             self.assertIn("(parent.%sOn&&parent.%sSource==1)" % (eid, eid), block)
+
+    def _block(self, name, kind="Expression"):
+        end = self.tcl.index("name %s\n" % name)
+        return self.tcl[self.tcl.rindex("%s {" % kind, 0, end):end]
+
+    def _geo_span(self):
+        start = self.tcl.index("NoOp {\n name %s\n" % fe.GEO)
+        return start, self.tcl.index("\n}", start)
+
+    def test_coloured_kernels_floor_every_channel(self):
+        # Convolve2 normalizes each channel by its own kernel sum: r, g, b and
+        # alpha all need the floor (a pure-red ramp has a zero-sum green kernel).
+        names = ["irisKernel", "causticKernel", "ringHaloKernel"]
+        names += ["multiIris%dKernel" % i for i in range(fe.MULTI_IRIS_SLOTS)]
+        names += ["rings%dKernel" % i for i in range(fe.RING_SLOTS)]
+        names += ["g%dAperture" % n for n in range(lf.SLOTS)]
+        for name in names:
+            block = self._block(name)
+            for i in range(4):
+                line = re.search(r"\n expr%d \{.*\}\n" % i, block).group(0)
+                self.assertIn(fe.CENTRE_FLOOR, line, "%s expr%d" % (name, i))
+        for name in ("streakKernel", "glintKernel"):           # mono: alpha only
+            self.assertEqual(self._block(name).count(fe.CENTRE_FLOOR), 1, name)
+
+    def test_colour_clamped_non_negative(self):
+        self.assertTrue(fe.colour_expr("iris", "0.5", "1", "r").startswith("max(0,"))
+
+    def test_no_frame_outside_flare_geo(self):
+        # Per-frame values live once on the flareGeo NoOp, not in per-pixel expressions.
+        start, end = self._geo_span()
+        outside = [m.start() for m in re.finditer(r"\bframe\b", self.tcl) if not start <= m.start() < end]
+        self.assertEqual(outside, [])
+        geo = self.tcl[start:end]
+        for prefix in list(fe.COLOURED) + ["ghosts"]:
+            self.assertIn(" t_%s {{frame*parent.%sNoiseSpeed}}" % (prefix, prefix), geo)
+        self.assertIn(" t_shimmer {{frame*parent.shimmerSpeed}}", geo)
+        self.assertIn(" t_sparkle {{frame*parent.sparkleSpeed}}", geo)
+
+    def test_flare_geo_refs_are_defined(self):
+        start, end = self._geo_span()
+        defined = set(re.findall(r"addUserKnob \{7 (\w+)\}", self.tcl[start:end]))
+        used = set(re.findall(r"%s\.(\w+)" % fe.GEO, self.tcl))
+        self.assertTrue(used)
+        self.assertEqual(sorted(used - defined), [])
+        self.assertLess(self.tcl.index("name overscanGrow"), start)
+        self.assertLess(start, self.tcl.index("name ghostsLight"))
+
+    def test_balance_per_shape_unfloored(self):
+        start, end = self._geo_span()
+        geo = self.tcl[start:end]
+        for prefix, shape in fe.BALANCE_SHAPES:
+            for ch, expr in zip("rgb", fe.colour_balance(prefix, shape)):
+                self.assertIn(" bal_%s_%s {{%s}}" % (prefix, ch, expr), geo)
+                self.assertTrue(expr.startswith("(parent.%sColorMode==0?1:(" % prefix), expr[:60])
+        filled = fe.colour_balance("iris", "filled")[0]
+        ring = fe.colour_balance("rings", "ring")[0]
+        weights = dict(fe.balance_weight_knobs("iris", "filled"))
+        self.assertEqual(len(weights), fe.FILLED_SAMPLES + 2)
+        for name, expr in weights.items():
+            self.assertIn(" %s {{%s}}" % (name, expr), geo)
+        self.assertTrue(weights["w_iris_core"].startswith("pow(min(1-clamp(parent.irisColorWidth,0.05,1),"))
+        self.assertIn("acos(", weights["w_iris_7"])                                   # aperture polygon coverage
+        self.assertIn("parent.causticSharpness", dict(fe.balance_weight_knobs("caustic", "filled"))["w_caustic_3"])
+        self.assertTrue(filled.endswith(")/%s.w_iris_sum))" % fe.GEO))
+        self.assertIn("%s.w_iris_core+" % fe.GEO, filled)                           # white core, colour 1
+        self.assertEqual(filled.count("max(0,(parent.irisColorMode==1?"), fe.FILLED_SAMPLES)
+        self.assertEqual(ring.count("max(0,(parent.ringsColorMode==1?"), fe.RING_SAMPLES)
+        # Old bug: the balance was floored, so a channel the colour lacks
+        # still got a faint centre dot. Only ramp position spans are floored.
+        self.assertEqual(re.findall(r"max\(0\.0001,[^,()]*Ramp\d\.[rgb]", filled + ring), [])
+        for tag in ["iris", "caustic"] + ["multiIris%d" % i for i in range(fe.MULTI_IRIS_SLOTS)]:
+            self.assertIn("%s.bal_" % fe.GEO, self._block(tag + "Gain"), tag)
+
+    def test_ring_halo_balance_only_in_light_mode(self):
+        block = self._block("ringHaloGain")
+        for b in fe.balance_refs("ringHalo"):
+            self.assertIn("(parent.ringHaloCentre==1?%s:1)" % b, block)
+
+    def test_even_fields_use_fixed_reference(self):
+        self.assertNotIn("ArcFalloff", self._block("ringHaloOrbital", "MergeExpression"))
+        self.assertNotIn("washSpread", self._block("washMix", "MergeExpression"))
+        self.assertIn("/(%g*" % fe.EVEN_REF_PX, self._block("ringHaloOrbital", "MergeExpression"))
+        self.assertIn("/(%g*" % fe.WASH_REF_PX, self._block("washMix", "MergeExpression"))
+        self.assertIn("parent.ringHaloArc>=1}}", self._block("ringHaloEven", "Blur"))
+        self.assertIn("!parent.ringHaloOn||", self._block("ringHaloEven", "Blur"))
+        self.assertIn("{{!parent.washOn||parent.washBias>=1}}", self._block("washEven", "Blur"))
+        self.assertIn("{{!parent.washOn||parent.washBias<=0}}", self._block("washNear", "Blur"))
+
+    def test_noise_clamped_and_per_slot(self):
+        for prefix in list(fe.COLOURED) + ["ghosts"]:
+            self.assertIn("clamp(parent.%sNoise,0,1)" % prefix, self.tcl, prefix)
+            self.assertNotIn("(1-parent.%sNoise+" % prefix, self.tcl, prefix)
+        self.assertIn("%s*0.1+7.31)" % fe.time_ref("rings"), self._block("rings1Kernel"))
+        self.assertIn("%s*0.1+%g)" % (fe.time_ref("multiIris"), 3 * 7.31), self._block("multiIris3Kernel"))
+        self.assertIn("%s*0.1+%g)" % (fe.time_ref("ghosts"), 2 * 7.31), self._block("g2Aperture"))
+        self.assertIn("%s*0.1)" % fe.time_ref("ghosts"), self._block("g0Aperture"))
+
+    def test_output_bbox_cropped_to_frame(self):
+        self.assertIn("Crop {\n box {{0} {0} {highlights.width} {highlights.height}}\n crop false\n name flareCrop\n}",
+                      self.tcl)
+        # Down and up are both to-box distorts, so the up-scale exactly inverts
+        # the down-scale even when the working size rounds (858 x 0.25).
+        for name in ("flareDown", "flareUp"):
+            end = self.tcl.index("name %s\n" % name)
+            block = self.tcl[self.tcl.rindex("Reformat {", 0, end):end]
+            self.assertIn(' type "to box"\n', block, name)
+            self.assertIn(" resize distort\n", block, name)
+        self.assertIn("box_width {{highlights.width}}", self.tcl)
+        self.assertIn("box_height {{highlights.height}}", self.tcl)
+        self.assertLess(self.tcl.index("name flareUp"), self.tcl.index("name flareCrop"))
+        self.assertLess(self.tcl.index("name flareCrop"), self.tcl.index("name combine"))
+
+    def test_ghosts_offset_applied_once(self):
+        self.assertEqual(self.tcl.count("parent.ghostsOffset.x"), 1)
+        self.assertGreater(self.tcl.index("name ghostsOffsetT"), self.tcl.index("name g%dGain" % (lf.SLOTS - 1)))
+        self.assertIn("push $ghosts\n", self.tcl)
+        for n in range(lf.SLOTS):
+            self.assertNotIn("push $g%d\npush $acc" % n, self.tcl)
+
+    def test_tooltips(self):
+        mode_tip = [t for t in fe.COLOUR_EXTRA if t[0] == "ColorMode"][0][-1]
+        self.assertIn("Spectrum/Ramp cost 3x the render time of Tint for that element.", mode_tip)
+        for eid, suffix in (("ringHalo", "Arc"), ("wash", "Bias")):
+            tip = [t for t in fe.EXTRA[eid] if t[0] == suffix][0][-1]
+            self.assertIn("fixed reference size", tip, eid)
 
 
 if __name__ == "__main__":

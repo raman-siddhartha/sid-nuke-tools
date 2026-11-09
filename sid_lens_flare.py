@@ -64,11 +64,13 @@ def _aperture_expr(radius_expr, channels=(3,)):
 def _ghost_tcl(n):
     """One ghost slot: per-channel scale about the optical centre (dispersion),
     aperture convolution at the solved spot radius, coating colour x energy.
-    Slots at or beyond Ghost Count are disabled and output black."""
-    off = "{{parent.ghostCount<=%d||!parent.ghostsOn}}" % n
-    cx = "{parent.opticalCenter.x*%s}" % RES
-    cy = "{parent.opticalCenter.y*%s}" % RES
-    out = ["push $hl"]
+    Slots at or beyond Ghost Count are disabled and output black. The ghosts
+    Offset is applied once to the summed slots (_ghosts_sum_tcl)."""
+    off_inner = "parent.ghostCount<=%d||!parent.ghostsOn" % n
+    off = "{{%s}}" % off_inner
+    cx = "{%s}" % elements.CX          # optical centre on the overscan-padded canvas
+    cy = "{%s}" % elements.CY
+    out = ["push $ghl"]                # highlights after the ghosts' Light Colour blend
     for ch, key in (("red", "R"), ("green", "G"), ("blue", "B")):
         if key == "G":
             scale = "parent.g%dsG" % n
@@ -78,18 +80,34 @@ def _ghost_tcl(n):
             "TransformMasked {\n channels rgba.%s\n scale {{%s}}\n center {%s %s}\n"
             " filter cubic\n black_outside true\n disable %s\n name g%dT%s\n}" % (ch, scale, cx, cy, off, n, key))
     out.append("set g%dsrc [stack 0]" % n)
-    out.append("push $hl")
-    out.append("Expression {\n%s disable %s\n name g%dAperture\n}"
-               % (_aperture_expr("parent.g%drad*width/parent.sensorWidth" % n), off, n))
-    out.append("push $g%dsrc" % n)
-    out.append("Convolve2 {\n inputs 2\n channels rgb\n filter_channel rgba.alpha\n normalize true\n"
-               " disable %s\n name g%dConv\n}" % (off, n))
+    # RGBA aperture kernel: px per mm comes from the unpadded working width.
+    radius = "parent.g%drad*%s/parent.sensorWidth" % (n, elements.FW)
+    u, band = elements.filled_band("ghosts")
+    lines = elements.coloured_kernel_lines("ghosts", elements.shape_temps(radius),
+                                           elements.iris_shape("0.5"), u, band, "aw", n)
+    out.append("push $hl\nExpression {\n%s\n disable %s\n name g%dAperture\n}"
+               % ("\n".join(elements.with_floor(lines)), off, n))
+    out.append("set g%dK [stack 0]" % n)
+    out.append(elements.coloured_conv_tcl("ghosts", "g%dK" % n, "g%dsrc" % n, off_inner, "g%d" % n))
+    bal = elements.balance_refs("ghosts")
     out.append(
         "Expression {\n"
         " temp_name0 on\n temp_expr0 {parent.ghostsOn*(parent.ghostCount>%d)*parent.ghostIntensity}\n"
-        " expr0 {r*on*parent.g%deR}\n expr1 {g*on*parent.g%deG}\n expr2 {b*on*parent.g%deB}\n expr3 0\n"
-        " name g%dGain\n}" % (n, n, n, n, n))
+        " expr0 {r*on*parent.g%deR*%s}\n expr1 {g*on*parent.g%deG*%s}\n expr2 {b*on*parent.g%deB*%s}\n expr3 0\n"
+        " name g%dGain\n}" % (n, n, bal[0], n, bal[1], n, bal[2], n))
     out.append("set g%d [stack 0]" % n)
+    return "\n".join(out)
+
+
+def _ghosts_sum_tcl():
+    """Sum of every ghost slot, then the ghosts Offset once. Leaves $ghosts."""
+    out = []
+    acc = "$g0"
+    for n in range(1, SLOTS):
+        out.append("push $g%d\npush %s\nMerge2 { inputs 2 operation plus also_merge all }\nset gh_acc [stack 0]"
+                   % (n, acc))
+        acc = "$gh_acc"
+    out.append("push %s\n%s\nset ghosts [stack 0]" % (acc, elements.offset_tcl("ghosts", "ghostsOffsetT")))
     return "\n".join(out)
 
 
@@ -146,14 +164,19 @@ def _starburst_tcl():
                   " normalize true", " disable {{parent.starIntensity<=0||!parent.starOn}}", " name star_%s" % ch, "}",
                   "set star_in [stack 0]"]
     lines += ["Expression {", " expr0 {r*parent.starOn*parent.starIntensity}", " expr1 {g*parent.starOn*parent.starIntensity}",
-              " expr2 {b*parent.starOn*parent.starIntensity}", " expr3 0", " name starGain", "}", "set star [stack 0]"]
+              " expr2 {b*parent.starOn*parent.starIntensity}", " expr3 0", " name starGain", "}",
+              elements.offset_tcl("star", "starOffsetT"), "set star [stack 0]"]
     return "\n".join(lines)
 
 
 def build_tcl():
-    """Whole internal graph as TCL. Order: highlights -> Reformat down ($hl, the
-    downscaled highlight stream every branch reads) -> ghost slots, starburst,
-    glare, hotspot + flare elements (sid_flare_elements) -> summed, Reformat up -> merged over the plate -> output switch -> mask mix."""
+    """Whole internal graph as TCL. Order: highlights -> Reformat down ->
+    overscan pad ($hl: the padded, downscaled highlight stream every branch
+    reads) -> ghost slots, starburst, glare, hotspot + flare elements
+    (sid_flare_elements) -> summed -> overscan crop -> Reformat up -> Crop
+    (bbox clamped to the frame) -> merged over the plate -> output switch ->
+    mask mix. The flareGeo NoOp (sid_flare_elements.geo_tcl) sits after the
+    pad and holds the per-frame constants every branch reads."""
     parts = ["""
 Input { inputs 0 name Source xpos 0 ypos 0 }
 set in_src [stack 0]
@@ -174,14 +197,36 @@ Expression {
 }
 set hl_full [stack 0]
 Reformat {
- type scale
- scale {{""" + RES + """}}
+ type "to box"
+ box_width {{max(1,floor(highlights.width*""" + RES + """+0.5))}}
+ box_height {{max(1,floor(highlights.height*""" + RES + """+0.5))}}
+ box_fixed true
+ resize distort
  name flareDown
 }
+Reformat {
+ type "to box"
+ box_width {{input.width+2*floor(input.width*parent.overscan/100)}}
+ box_height {{input.height+2*floor(input.height*parent.overscan/100)}}
+ box_fixed true
+ resize none
+ center true
+ black_outside true
+ name overscanPad
+}
+AdjBBox {
+ numpixels {{max(floor(flareDown.width*parent.overscan/100),floor(flareDown.height*parent.overscan/100))+4}}
+ name overscanGrow
+}
 set hl [stack 0]
+""" + elements.geo_tcl() + """
+push $hl
+""" + elements.light_colour_tcl("ghosts", "ghostsLight") + """
+set ghl [stack 0]
 """]
     for n in range(SLOTS):
         parts.append(_ghost_tcl(n))
+    parts.append(_ghosts_sum_tcl())
     parts.append(_starburst_tcl())
     parts.append("""
 push $hl
@@ -202,16 +247,33 @@ set glare [stack 0]
 """)
     parts.append(elements.elements_tcl())
     acc = "$star"
-    for src in ["$glare"] + ["$g%d" % n for n in range(SLOTS)] + elements.element_vars():
+    for src in ["$glare", "$ghosts"] + elements.element_vars():
         parts.append("push %s\npush %s\nMerge2 { inputs 2 operation plus also_merge all }\nset acc [stack 0]"
                      % (src, acc))
         acc = "$acc"
     parts.append("""
 push $acc
 Reformat {
- type scale
- scale {{1/""" + RES + """}}
+ type "to box"
+ box_width {{flareDown.width}}
+ box_height {{flareDown.height}}
+ box_fixed true
+ resize none
+ center true
+ name overscanCrop
+}
+Reformat {
+ type "to box"
+ box_width {{highlights.width}}
+ box_height {{highlights.height}}
+ box_fixed true
+ resize distort
  name flareUp
+}
+Crop {
+ box {{0} {0} {highlights.width} {highlights.height}}
+ crop false
+ name flareCrop
 }
 set flare [stack 0]
 
@@ -361,20 +423,34 @@ def _add_knobs(group, width, height):
     ghosts_on = nuke.Boolean_Knob("ghostsOn", "Ghosts", True)
     star_on = nuke.Boolean_Knob("starOn", "Starburst", True)
     glare_on = nuke.Boolean_Knob("glareOn", "Veiling Glare", True)
+    overscan_k = _double("overscan", "Overscan %", 0.0, 100.0, 25.0,
+                         "Extra canvas around the frame (per side) so shapes are not cropped at the "
+                         "frame edge and light does not wrap across it. Costs render time: "
+                         "25% is about 2.25x the canvas area.")
 
-    for k in [nuke.Tab_Knob("tabLens", "Lens"),
-              preset_k, custom_k, fstop_k, sensor_k, center_k,
-              _divider("divSrc"), _heading("hdrSrc", "Source"), thr_k, knee_k, stops_k,
-              _divider("divAp"), _heading("hdrAp", "Aperture"), blades_k, round_k, rot_k,
-              _divider("divOut"), _heading("hdrOut", "Output"), res_k, mode_k, inv_k, mix_k, status_k,
-              nuke.Tab_Knob("tabGhosts", "Ghosts & Glare"),
-              ghosts_on, count_k, gint_k, disp_k, coat_k,
-              _divider("divStar"), star_on, sint_k, slen_k, sthk_k, sfall_k,
-              srot_k, schr_k, sirr_k, sseed_k,
-              _divider("divGlare"), glare_on, glint_k, glsize_k] + hidden:
+    def _offset_knob(prefix):
+        k = nuke.XY_Knob(prefix + "Offset", "Offset")
+        k.setValue([0.0, 0.0])
+        k.setTooltip("Art-direct move in plate px, on top of the physical position.")
+        return k
+
+    lens_tab = [nuke.Tab_Knob("tabLens", "Lens"),
+                preset_k, custom_k, fstop_k, sensor_k,
+                _divider("divSrc"), _heading("hdrSrc", "Source"), thr_k, knee_k, stops_k,
+                _divider("divAp"), _heading("hdrAp", "Aperture"), blades_k, round_k, rot_k,
+                _divider("divOut"), _heading("hdrOut", "Output"), res_k, overscan_k, mode_k, inv_k, mix_k,
+                status_k]
+    ghosts_tab = ([nuke.Tab_Knob("tabGhosts", "Ghosts & Glare"),
+                   ghosts_on, count_k, gint_k, disp_k, coat_k]
+                  + elements.colour_knobs(nuke, "ghosts")
+                  + [_offset_knob("ghosts"),
+                     _divider("divStar"), star_on, sint_k, slen_k, sthk_k, sfall_k,
+                     srot_k, schr_k, sirr_k, sseed_k, _offset_knob("star"),
+                     _divider("divGlare"), glare_on, glint_k, glsize_k])
+    for k in lens_tab + ghosts_tab + hidden:
         group.addKnob(k)
 
-    elements.add_element_knobs(group, nuke)
+    elements.add_element_knobs(group, nuke, center_k)
 
     group.addKnob(_divider("creditDivider"))
     group.addKnob(nuke.Text_Knob("credit", "", "<span style='color:#777; font-size:11px;'>"
