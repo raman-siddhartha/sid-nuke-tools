@@ -1,7 +1,7 @@
 # Integration check inside Nuke (works in Non-Commercial mode):
 #     "C:/Program Files/Nuke17.1v3/Nuke17.1.exe" --nc -t tests/nuke_flare_check.py
-# Touches about 5 Python Node objects (root, the test source, the LensFlare
-# group, the internal starKernel, plus selectedNode inside make_lens_flare),
+# Touches about 6 Python Node objects (root, the test source, the LensFlare
+# group, the internal starKernel and hotspot nodes, plus selectedNode inside make_lens_flare),
 # well under the NC 10-node limit. Exits non-zero on failure.
 import math
 import os
@@ -37,6 +37,7 @@ src = nuke.toNode("flareTestSrc")
 src.setSelected(True)
 
 import sid_lens_flare as lf  # noqa: E402
+import sid_flare_elements as fe  # noqa: E402
 
 g = lf.make_lens_flare()
 
@@ -65,6 +66,16 @@ def reset():
         g[name].setValue(val)
     g["outputMode"].setValue("Flare over Plate")
     g["flareRes"].setValue("Half")
+    for name in ("ghostsOn", "starOn", "glareOn"):
+        g[name].setValue(True)
+    for name, val in (("starLength", 60.0), ("starThickness", 2.0), ("starFalloff", 1.0),
+                      ("starRotation", 0.0), ("starChroma", 1.0), ("starIrregularity", 0.0)):
+        g[name].setValue(val)
+    for eid, _l, _f, src_default in fe.ELEMENTS:
+        g[eid + "On"].setValue(False)
+        g[eid + "Intensity"].setValue(fe.DEFAULT_INTENSITY[eid])
+        g[eid + "Source"].setValue(src_default)
+        g[eid + "Tint"].setValue([1.0, 1.0, 1.0])
     lf.solve(g)
 
 
@@ -230,6 +241,202 @@ if kern is not None:
         peaks = sum(1 for k, i in enumerate(cand) if (i - cand[k - 1]) % N > 10) if cand else 0
         check(peaks == _o.starburst_spikes(blades),
               "blades %d -> %d starburst spikes (expected %d)" % (blades, peaks, _o.starburst_spikes(blades)))
+
+    # Length must really shorten the spikes (old bug: a 1px floor plus a 1/r^2
+    # tail made Length 1 and 10 render identically). Spike at 30 deg for 6 blades.
+    g["blades"].setValue(6)
+    g["starRotation"].setValue(0.0)
+
+    def along(r):
+        a = math.radians(30.0)
+        return nuke.sample(kern, "g", kw / 2.0 + r * math.cos(a), kh / 2.0 + r * math.sin(a))
+
+    rel = {}
+    for L in (1.0, 10.0, 60.0):
+        g["starLength"].setValue(L)
+        rel[L] = along(12) / max(along(3), 1e-30)
+    check(rel[1.0] < 1e-4 < rel[10.0] < rel[60.0],
+          "Length shortens spikes: r12/r3 = %.3g (L1) < %.3g (L10) < %.3g (L60)"
+          % (rel[1.0], rel[10.0], rel[60.0]))
+
+# -- Flare elements (v2) ----------------------------------------------------------
+# Each element alone (everything else off, Flare Only): off adds exactly 0; on
+# lights the expected place clearly more than a control place.
+P = (SRC_X, SRC_Y)
+C = (320.0, 180.0)
+
+
+def axial(pos):
+    return C[0] + pos * (P[0] - C[0]), C[1] + pos * (P[1] - C[1])
+
+
+def grid_max():
+    return max(s(x, y) for x in range(5, 640, 30) for y in range(5, 360, 30))
+
+
+def ring_max(cx, cy, r):
+    return max(s(cx + r * math.cos(i / 10.0), cy + r * math.sin(i / 10.0)) for i in range(63))
+
+
+def elements_only(eid):
+    reset()
+    for name in ("ghostsOn", "starOn", "glareOn"):
+        g[name].setValue(False)
+    g["outputMode"].setValue("Flare Only")
+    if eid:
+        g[eid + "On"].setValue(True)
+
+
+elements_only(None)
+check(grid_max() == 0.0, "everything off (ghosts/star/glare switches + all elements) gives black")
+
+hoop_dir = (P[0] - C[0], P[1] - C[1])
+hoop_n = math.hypot(*hoop_dir)
+hoop_r = 0.45 * 360
+EXPECT = {
+    # eid: (bright point value, control value, description)
+    "streak": (lambda: s(P[0] + 60, P[1]), lambda: s(P[0], P[1] + 60), "along the streak vs across it"),
+    "spikeBall": (lambda: ring_max(P[0], P[1], 30), lambda: s(5, 5), "rays around the light vs far corner"),
+    "shimmer": (lambda: ring_max(P[0], P[1], 25), lambda: s(5, 5), "rays around the light vs far corner"),
+    "sparkle": (lambda: s(*P), lambda: s(5, 5), "at the light vs far corner"),
+    "glint": (lambda: s(*P), lambda: s(P[0] + 30, P[1]), "core vs off-spike point"),
+    "iris": (lambda: s(*axial(-0.6)), lambda: s(*axial(0.6)), "at Position -0.6 vs +0.6"),
+    "multiIris": (lambda: max(s(*axial(t / 20.0)) for t in range(-24, 25)), lambda: s(5, 355),
+                  "along the axis vs off-axis corner"),
+    "rings": (lambda: s(axial(-0.9)[0] + 120, axial(-0.9)[1]), lambda: s(*axial(-0.9)), "on the ring vs its centre"),
+    "caustic": (lambda: s(axial(-0.3)[0] + 80, axial(-0.3)[1]), lambda: s(*axial(-0.3)),
+                "bright edge vs dim centre"),
+    "hoop": (lambda: s(C[0] + hoop_r * hoop_dir[0] / hoop_n, C[1] + hoop_r * hoop_dir[1] / hoop_n),
+             lambda: s(C[0] - hoop_r * hoop_dir[0] / hoop_n, C[1] - hoop_r * hoop_dir[1] / hoop_n),
+             "arc facing the light vs opposite arc"),
+    "orbs": (lambda: sum(s(x, y) for x in range(330, 640, 10) for y in range(180, 360, 10)),
+             lambda: sum(s(x, y) for x in range(0, 310, 10) for y in range(0, 180, 10)),
+             "quadrant near the light vs far quadrant"),
+}
+for eid, (bright, control, what) in EXPECT.items():
+    elements_only(eid)
+    if eid == "multiIris":
+        g["multiIrisCount"].setValue(8)
+    b, c = bright(), control()
+    check(b > 1e-6 and b > 2.0 * abs(c), "%s on: %s (%.4g vs %.4g)" % (eid, what, b, c))
+    g[eid + "On"].setValue(False)
+    check(grid_max() == 0.0, "%s off adds nothing" % eid)
+
+# Tint and animation.
+elements_only("shimmer")
+pt = (P[0] + 20, P[1] + 7)
+g["shimmerTint"].setValue([1.0, 0.0, 0.0])
+check(s(pt[0], pt[1], "r") > 0 and s(pt[0], pt[1], "g") == 0.0, "Tint red: only red survives")
+g["shimmerTint"].setValue([1.0, 1.0, 1.0])
+g["shimmerSpeed"].setValue(2.0)
+nuke.frame(1)
+f1 = s(*pt)
+nuke.frame(5)
+f5 = s(*pt)
+g["shimmerSpeed"].setValue(0.0)
+z5 = s(*pt)
+nuke.frame(1)
+z1 = s(*pt)
+check(abs(f1 - f5) > 1e-6 and z1 == z5, "Shimmer animates at Speed 2 (%.4g -> %.4g), still at Speed 0" % (f1, f5))
+
+elements_only("sparkle")
+g["sparkleIntensity"].setValue(0.01)
+ray = (P[0] + 12, P[1])                       # on the 0-degree ray of the default 4-point sparkle
+g["sparkleSpeed"].setValue(2.0)
+nuke.frame(1)
+f1 = s(*ray)
+nuke.frame(5)
+f5 = s(*ray)
+g["sparkleSpeed"].setValue(0.0)
+z5 = s(*ray)
+nuke.frame(1)
+z1 = s(*ray)
+check(f1 > 0 and abs(f1 - f5) > 1e-6 * f1 and z1 == z5,
+      "Sparkle twinkles at Speed 2 (%.4g -> %.4g), still at Speed 0" % (f1, f5))
+
+# Each existing-part switch removes exactly that part: (all on) - (X off) == (X only).
+probes = [(P[0] + 20, P[1] + 2), (P[0], P[1] - 40), (330, 200), (150, 110), (562, 286)]
+
+
+def total():
+    return [s(x, y) for x, y in probes]
+
+
+for part in ("ghostsOn", "starOn", "glareOn"):
+    reset()
+    g["outputMode"].setValue("Flare Only")
+    everything = total()
+    g[part].setValue(False)
+    without = total()
+    for other in ("ghostsOn", "starOn", "glareOn"):
+        g[other].setValue(other == part)
+    alone = total()
+    err = max(abs((a - b) - c) for a, b, c in zip(everything, without, alone))
+    check(max(alone) > 0 and err <= 1e-4 * max(everything), "%s switch removes exactly that part (err %.3g)" % (part, err))
+
+# Iris is an aperture ghost: stopping down shrinks it (size x 2.8 / effective f-stop).
+def iris_width():
+    cx, cy = axial(-0.6)
+    return sum(1 for d in range(-80, 81) if s(cx + d, cy) > 1e-4)
+
+
+elements_only("iris")
+w28 = iris_width()
+g["fstop"].setValue(5.6)
+w56 = iris_width()
+check(w56 > 0 and abs(w56 / float(w28) - 0.5) < 0.15, "Iris halves when stopping down f/2.8 -> f/5.6 (%d -> %d px)" % (w28, w56))
+
+# Glint: the 45-degree spike (default Angle 45) is much brighter than an off-spike point.
+elements_only("glint")
+spike = s(P[0] + 20 * math.cos(math.radians(45)), P[1] + 20 * math.sin(math.radians(45)))
+off_spike = s(P[0] + 20, P[1])
+check(spike > 1e-6 and spike > 5.0 * abs(off_spike),
+      "glint kernel: 45-degree spike %.4g > 5x off-spike %.4g" % (spike, off_spike))
+
+# Extreme values stay finite: every Double/Int extra at its slider maximum.
+for eid, _l, _f, _s in fe.ELEMENTS:
+    elements_only(eid)
+    for suffix, _lab, kind, _lo, hi, _default, _tip in fe.EXTRA[eid]:
+        if kind == "d" or kind == "i":
+            g[eid + suffix].setValue(hi)
+    pts = [(5 + 70 * i, 5 + 85 * j) for i in range(9) for j in range(5)] + [P]
+    vals = [s(x, y) for x, y in pts]
+    check(all(math.isfinite(v) for v in vals) and any(v != 0.0 for v in vals),
+          "%s at slider maxima: finite and not all zero (max %.4g)" % (eid, max(vals)))
+
+# Hotspot: two separated lights -> exactly two hotspot pixels, at the light centres.
+src["expr0"].setValue("hypot(x+0.5-160.5,y+0.5-90.5)<6?5:(hypot(x+0.5-480.5,y+0.5-250.5)<10?3:r)")
+src["expr1"].setValue("hypot(x+0.5-160.5,y+0.5-90.5)<6?5:(hypot(x+0.5-480.5,y+0.5-250.5)<10?3:g)")
+src["expr2"].setValue("hypot(x+0.5-160.5,y+0.5-90.5)<6?5:(hypot(x+0.5-480.5,y+0.5-250.5)<10?3:b)")
+elements_only("glint")                        # glint defaults to Hotspot, so the detector runs
+with g:
+    hot = nuke.toNode("hotspot")
+check(hot is not None, "hotspot node found")
+if hot is not None:
+    hw, hh = hot.width(), hot.height()       # working (half) resolution
+    peaks = [(x, y) for x in range(hw) for y in range(hh) if nuke.sample(hot, "g", x + 0.5, y + 0.5) > 0]
+    near = all(min(math.hypot(2 * (x + 0.5) - lx, 2 * (y + 0.5) - ly) for lx, ly in ((160.5, 90.5), (480.5, 250.5))) < 4
+               for x, y in peaks)
+    check(len(peaks) == 2 and near, "two lights (one clipped flat) -> exactly 2 hotspots at their centres: %s" % peaks)
+    # Energy: each hotspot pixel carries its light's box-summed energy, so the sum over
+    # both equals the working-resolution highlight energy (plate-px energy / 4 at Half).
+    hot_sum = sum(nuke.sample(hot, "g", x + 0.5, y + 0.5) for x, y in peaks)
+    expect_e = (5 * math.pi * 6 ** 2 + 3 * math.pi * 10 ** 2) * 4096 / 4.0
+    check(abs(hot_sum - expect_e) < 0.05 * expect_e,
+          "hotspot energy %.5g within 5%% of the lights' working-res energy %.5g" % (hot_sum, expect_e))
+
+    # Big clipped light: a flat disc far wider than a point must still give ONE hotspot, near its centre.
+    DX, DY = 420.5, 200.5
+    for ch in ("expr0", "expr1", "expr2"):
+        src[ch].setValue("hypot(x+0.5-%s,y+0.5-%s)<30?3:%s" % (DX, DY, "rgb"[int(ch[-1])]))
+    elements_only("glint")
+    big = [(x, y) for x in range(hw) for y in range(hh) if nuke.sample(hot, "g", x + 0.5, y + 0.5) > 0]
+    big_near = all(math.hypot(2 * (x + 0.5) - DX, 2 * (y + 0.5) - DY) <= 3 for x, y in big)
+    check(len(big) == 1 and big_near, "big clipped disc (radius 30) -> exactly 1 hotspot within 3px of its centre: %s" % big)
+
+# Restore the single-light source for anything that follows.
+for ch, c in (("expr0", "r"), ("expr1", "g"), ("expr2", "b")):
+    src[ch].setValue("hypot(x+0.5-%s,y+0.5-%s)<6?%s:%s" % (SRC_X, SRC_Y, SRC_V, c))
 
 print("\n%d failure(s)" % len(FAILS))
 sys.exit(1 if FAILS else 0)

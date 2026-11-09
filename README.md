@@ -6,7 +6,8 @@ Contents
 sid_match_tools.py   - Neutralize, Match Black, Match White, Match Colour
 sid_edge_extend.py   - Edge Extend, Alpha Edge, Light Wrap
 sid_edge_extend_blur.py - Edge Extend Blur (Edge Extend + final edge blur)
-sid_lens_flare.py    - Lens Flare (needs sid_lens_optics.py next to it)
+sid_lens_flare.py    - Lens Flare (needs sid_lens_optics.py and
+                       sid_flare_elements.py next to it)
 menu.py              - registers all of the above under Nodes > Sid
 
 Install
@@ -99,3 +100,32 @@ even n gives n spikes, odd n gives 2n) and veiling glare.
 - Output: Flare over Plate, Flare Only, Highlights, Aperture.
 - Tests: python -m unittest discover -s tests   (no Nuke needed)
          Nuke17.1.exe --nc -t tests/nuke_flare_check.py   (inside Nuke)
+
+Lens Flare panel tabs
+- Lens: lens, F-Stop, sensor, optical centre, source threshold/gain,
+  aperture, output.
+- Ghosts & Glare: Ghosts, Starburst and Veiling Glare, each with its
+  own on/off switch. Starburst shape: Length (plate px at f/4, no
+  minimum), Thickness, Falloff (1 soft tail, 2 Gaussian, higher = hard
+  needle), Rotation, Chromatic Spread, Irregularity + Seed.
+- Elements: eleven extra elements, all off by default. Each has Enable,
+  Intensity, Tint and Source:
+    All highlights - every bright pixel drives the element.
+    Hotspot        - one point per light (found every frame with native
+                     nodes; Hotspot Radius sets how close two lights can
+                     be before they merge). Keeps rays crisp on big lights.
+  Centred on each light (default Source: Hotspot):
+    Streak      anamorphic streak (Length, Thickness, Angle, Falloff)
+    Spike Ball  many thin random rays (Rays, Length, Variation, Seed)
+    Shimmer     flickering fine rays (Rays, Length, Speed, Seed)
+    Sparkle     small twinkling star (Points 4/6/8, Size, Twinkle Speed)
+    Glint       intense core + cross spikes (Size, Spike Length, Angle)
+  Along the flare axis (Position: 1 = at the light, 0 = optical centre,
+  -1 = mirror point; default Source: All highlights):
+    Iris        one aperture-shaped ghost (follows Blades/Roundness)
+    Multi-Iris  up to 8 aperture ghosts spread along the axis
+    Rings       up to 4 thin circular ghosts
+    Caustic     ghost with a bright cusped edge
+  Lit by nearby light (no transform):
+    Hoop        ring around the optical centre, brightest facing the light
+    Lens Orbs   dust on the front glass that lights up near a light

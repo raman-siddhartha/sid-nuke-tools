@@ -19,15 +19,16 @@
 import nuke
 
 import sid_lens_optics as optics
+import sid_flare_elements as elements
 
 SLOTS = optics.MAX_GHOST_SLOTS
 RES = "pow(0.5,parent.flareRes)"          # Full=1, Half=0.5, Quarter=0.25
 SLOT_KNOB_SUFFIXES = ("sR", "sG", "sB", "rad", "eR", "eG", "eB")
 SOLVE_KNOBS = ("lensPreset", "customPrescription", "fstop", "ghostCount", "coatings")
 CUSTOM = "Custom"
-SPIKE_WIDTH_PX = 1.2      # starburst spike cross-section width, in working-resolution px
-REF_WIDTH = 1920.0        # Starburst Length is defined for a 1920px-wide frame
-REF_FSTOP = 4.0           # Starburst Length is defined at f/4
+REF_FSTOP = 4.0           # Starburst Length is defined at f/4 (spikes lengthen as you stop down)
+AA_SIGMA_PX = 0.35        # minimum spike sigma (working px) so sub-pixel spikes don't alias
+MAX_RAYS = 24             # 12 blade edges x 2 half-rays
 BLADES = "clamp(parent.blades,3,12)"   # every TCL use of the Blades knob goes through this
 
 
@@ -64,7 +65,7 @@ def _ghost_tcl(n):
     """One ghost slot: per-channel scale about the optical centre (dispersion),
     aperture convolution at the solved spot radius, coating colour x energy.
     Slots at or beyond Ghost Count are disabled and output black."""
-    off = "{{parent.ghostCount<=%d}}" % n
+    off = "{{parent.ghostCount<=%d||!parent.ghostsOn}}" % n
     cx = "{parent.opticalCenter.x*%s}" % RES
     cy = "{parent.opticalCenter.y*%s}" % RES
     out = ["push $hl"]
@@ -85,60 +86,74 @@ def _ghost_tcl(n):
                " disable %s\n name g%dConv\n}" % (off, n))
     out.append(
         "Expression {\n"
-        " temp_name0 on\n temp_expr0 {(parent.ghostCount>%d)*parent.ghostIntensity}\n"
+        " temp_name0 on\n temp_expr0 {parent.ghostsOn*(parent.ghostCount>%d)*parent.ghostIntensity}\n"
         " expr0 {r*on*parent.g%deR}\n expr1 {g*on*parent.g%deG}\n expr2 {b*on*parent.g%deB}\n expr3 0\n"
         " name g%dGain\n}" % (n, n, n, n, n))
     out.append("set g%d [stack 0]" % n)
     return "\n".join(out)
 
 
-def _sinc2(arg):
-    """(sin(pi*s)/(pi*s))^2 written inline, guarded at 0 (Nuke expressions
-    have no user-defined functions)."""
-    return "((%s)<0.0001?1:pow(sin(pi*(%s))/(pi*(%s)),2))" % (arg, arg, arg)
+def _hash(j, a, b):
+    """Deterministic pseudo-random 0..1 for ray j, re-rolled by Seed
+    (fract(sin(.)*43758.5453); Nuke expressions have no user functions)."""
+    v = "sin(%g+parent.starSeed*%g)*43758.5453" % (j * a, b)
+    return "((%s)-floor(%s))" % (v, v)
 
 
 def _spike_sum(length_px_expr):
-    """Diffraction spikes of an n-blade aperture: one full line through the
-    centre along each edge normal (up to 12 blades), sinc^2 cross-profile,
-    Lorentzian ~1/r^2 fall-off of length `length_px_expr`. Odd blade counts
-    give 2n spikes; even counts give n, as opposite pairs coincide (the
-    doubled intensity is removed by Convolve2 normalize)."""
+    """Diffraction spikes of an n-blade aperture as 2n half-rays (up to 12
+    blades): for each blade edge a ray along its normal and one opposite.
+    Odd blade counts give 2n distinct spikes; even counts give n, as
+    opposite rays coincide (Convolve2 normalize removes the doubling).
+    Per ray: Gaussian cross-section (temp `sw`, Thickness), fall-off
+    exp(-(r/L)^Falloff) with L = `length_px_expr`, and Irregularity
+    randomising each ray's length and brightness (Seed)."""
+    rot = "(parent.apRotation+parent.starRotation)*pi/180"
     terms = []
-    for k in range(12):
-        th = "(parent.apRotation*pi/180+sec/2+%d*sec)" % k
-        terms.append("(%d<%s)*%s"
-                     % (k, BLADES, _sinc2("rad*abs(sin(ang-%s))/%g" % (th, SPIKE_WIDTH_PX))))
-    return "(rad<1.5?0:(%s)/(1+pow(rad/max(1,%s),2)))" % ("+".join(terms), length_px_expr)
+    for j in range(MAX_RAYS):
+        k, half = j % 12, j // 12
+        th = "(%s+sec/2+%d*sec+%d*pi)" % (rot, k, half)
+        ray_len = "max(0.01,(%s)*max(0.05,1+parent.starIrregularity*(2*%s-1)))" % (
+            length_px_expr, _hash(j, 12.9898, 78.233))
+        bright = "(1-0.8*parent.starIrregularity*%s)" % _hash(j, 39.3467, 11.135)
+        terms.append(
+            "(%d<%s)*(cos(ang-%s)>0)*%s*exp(-pow(rad*sin(ang-%s)/sw,2)/2)"
+            "*exp(-pow(rad/%s,max(0.2,parent.starFalloff)))"
+            % (k, BLADES, th, bright, th, ray_len))
+    return "(rad<0.5?0:%s)" % "+".join(terms)
 
 
 def _starburst_tcl():
     """Analytic diffraction kernel (wavelength-scaled per channel), convolved
-    with the highlights one channel at a time."""
+    with the highlights one channel at a time. Length and Thickness are in
+    plate px, converted to the working resolution here."""
     lines = ["push $hl", "Expression {",
              " temp_name0 rad", " temp_expr0 {hypot(x+0.5-width/2,y+0.5-height/2)}",
              " temp_name1 ang", " temp_expr1 {atan2(y+0.5-height/2,x+0.5-width/2)}",
-             " temp_name2 sec", " temp_expr2 {2*pi/" + BLADES + "}"]
+             " temp_name2 sec", " temp_expr2 {2*pi/" + BLADES + "}",
+             " temp_name3 sw",
+             " temp_expr3 {hypot(parent.starThickness*%s/2.355,%g)}" % (RES, AA_SIGMA_PX)]
     for i, w in enumerate(optics.WAVELENGTHS_UM):
-        length = "parent.starLength*width/%g*parent.effFstop/%g*%.4f" % (
-            REF_WIDTH, REF_FSTOP, w / optics.WAVELENGTHS_UM[1])
+        chroma = w / optics.WAVELENGTHS_UM[1] - 1.0
+        length = "parent.starLength*%s*parent.effFstop/%g*(1+parent.starChroma*%.4f)" % (
+            RES, REF_FSTOP, chroma)
         lines.append(" expr%d {%s}" % (i, _spike_sum(length)))
-    lines += [" expr3 0", " disable {{parent.starIntensity<=0}}", " name starKernel", "}",
+    lines += [" expr3 0", " disable {{parent.starIntensity<=0||!parent.starOn}}", " name starKernel", "}",
               "set starK [stack 0]", "push $hl", "set star_in [stack 0]"]
     for ch in ("red", "green", "blue"):
         lines += ["push $starK", "push $star_in",
                   "Convolve2 {", " inputs 2", " channels rgba.%s" % ch, " filter_channel rgba.%s" % ch,
-                  " normalize true", " disable {{parent.starIntensity<=0}}", " name star_%s" % ch, "}",
+                  " normalize true", " disable {{parent.starIntensity<=0||!parent.starOn}}", " name star_%s" % ch, "}",
                   "set star_in [stack 0]"]
-    lines += ["Expression {", " expr0 {r*parent.starIntensity}", " expr1 {g*parent.starIntensity}",
-              " expr2 {b*parent.starIntensity}", " expr3 0", " name starGain", "}", "set star [stack 0]"]
+    lines += ["Expression {", " expr0 {r*parent.starOn*parent.starIntensity}", " expr1 {g*parent.starOn*parent.starIntensity}",
+              " expr2 {b*parent.starOn*parent.starIntensity}", " expr3 0", " name starGain", "}", "set star [stack 0]"]
     return "\n".join(lines)
 
 
 def build_tcl():
     """Whole internal graph as TCL. Order: highlights -> Reformat down ($hl, the
     downscaled highlight stream every branch reads) -> ghost slots, starburst,
-    glare -> summed, Reformat up -> merged over the plate -> output switch -> mask mix."""
+    glare, hotspot + flare elements (sid_flare_elements) -> summed, Reformat up -> merged over the plate -> output switch -> mask mix."""
     parts = ["""
 Input { inputs 0 name Source xpos 0 ypos 0 }
 set in_src [stack 0]
@@ -170,23 +185,24 @@ set hl [stack 0]
     parts.append(_starburst_tcl())
     parts.append("""
 push $hl
-Blur { channels rgb size {{parent.glareSize*""" + RES + """}} disable {{parent.glareIntensity<=0}} name glareA }
+Blur { channels rgb size {{parent.glareSize*""" + RES + """}} disable {{parent.glareIntensity<=0||!parent.glareOn}} name glareA }
 set glareA [stack 0]
 push $hl
-Blur { channels rgb size {{parent.glareSize*4*""" + RES + """}} disable {{parent.glareIntensity<=0}} name glareB }
+Blur { channels rgb size {{parent.glareSize*4*""" + RES + """}} disable {{parent.glareIntensity<=0||!parent.glareOn}} name glareB }
 push $glareA
 Merge2 { inputs 2 operation plus also_merge all name glareSum }
 Expression {
- expr0 {r*0.5*parent.glareIntensity}
- expr1 {g*0.5*parent.glareIntensity}
- expr2 {b*0.5*parent.glareIntensity}
+ expr0 {r*0.5*parent.glareOn*parent.glareIntensity}
+ expr1 {g*0.5*parent.glareOn*parent.glareIntensity}
+ expr2 {b*0.5*parent.glareOn*parent.glareIntensity}
  expr3 0
  name glareGain
 }
 set glare [stack 0]
 """)
+    parts.append(elements.elements_tcl())
     acc = "$star"
-    for src in ["$glare"] + ["$g%d" % n for n in range(SLOTS)]:
+    for src in ["$glare"] + ["$g%d" % n for n in range(SLOTS)] + elements.element_vars():
         parts.append("push %s\npush %s\nMerge2 { inputs 2 operation plus also_merge all }\nset acc [stack 0]"
                      % (src, acc))
         acc = "$acc"
@@ -301,7 +317,20 @@ def _add_knobs(group, width, height):
     coat_k.setFlag(nuke.NO_ANIMATION)
 
     sint_k = _double("starIntensity", "Starburst Intensity", 0.0, 0.5, 0.02)
-    slen_k = _double("starLength", "Starburst Length", 1.0, 400.0, 60.0)
+    slen_k = _double("starLength", "Length", 0.5, 1000.0, 60.0,
+                     "Spike length in plate pixels at f/4 (spikes lengthen as you stop down).")
+    sthk_k = _double("starThickness", "Thickness", 0.5, 20.0, 2.0, "Spike width in plate pixels.")
+    sfall_k = _double("starFalloff", "Falloff", 0.3, 8.0, 1.0,
+                      "How spikes fade: 1 = soft exponential tail, 2 = Gaussian, higher = hard-ended needle.")
+    srot_k = _double("starRotation", "Rotation", -180.0, 180.0, 0.0,
+                     "Extra starburst rotation on top of the aperture Rotation.")
+    schr_k = _double("starChroma", "Chromatic Spread", 0.0, 3.0, 1.0,
+                     "0 = white spikes, 1 = physical (red longer than blue), above 1 = exaggerated.")
+    sirr_k = _double("starIrregularity", "Irregularity", 0.0, 1.0, 0.0,
+                     "Random per-spike length and brightness, like imperfect real blades.")
+    sseed_k = nuke.Int_Knob("starSeed", "Seed")
+    sseed_k.setValue(0)
+    sseed_k.setTooltip("Re-rolls the Irregularity pattern.")
     glint_k = _double("glareIntensity", "Glare Intensity", 0.0, 0.0005, 0.00001,
                       "Tiny values are normal: highlights are already lifted by Source Gain (2^stops).")
     glsize_k = _double("glareSize", "Glare Size", 10.0, 1000.0, 200.0)
@@ -329,14 +358,23 @@ def _add_knobs(group, width, height):
     eff_k.setFlag(nuke.INVISIBLE)
     hidden.append(eff_k)
 
-    for k in [preset_k, custom_k, fstop_k, sensor_k, center_k,
+    ghosts_on = nuke.Boolean_Knob("ghostsOn", "Ghosts", True)
+    star_on = nuke.Boolean_Knob("starOn", "Starburst", True)
+    glare_on = nuke.Boolean_Knob("glareOn", "Veiling Glare", True)
+
+    for k in [nuke.Tab_Knob("tabLens", "Lens"),
+              preset_k, custom_k, fstop_k, sensor_k, center_k,
               _divider("divSrc"), _heading("hdrSrc", "Source"), thr_k, knee_k, stops_k,
               _divider("divAp"), _heading("hdrAp", "Aperture"), blades_k, round_k, rot_k,
-              _divider("divGhost"), _heading("hdrGhost", "Ghosts"), count_k, gint_k, disp_k, coat_k,
-              _divider("divStar"), _heading("hdrStar", "Starburst"), sint_k, slen_k,
-              _divider("divGlare"), _heading("hdrGlare", "Veiling Glare"), glint_k, glsize_k,
-              _divider("divOut"), _heading("hdrOut", "Output"), res_k, mode_k, inv_k, mix_k, status_k] + hidden:
+              _divider("divOut"), _heading("hdrOut", "Output"), res_k, mode_k, inv_k, mix_k, status_k,
+              nuke.Tab_Knob("tabGhosts", "Ghosts & Glare"),
+              ghosts_on, count_k, gint_k, disp_k, coat_k,
+              _divider("divStar"), star_on, sint_k, slen_k, sthk_k, sfall_k,
+              srot_k, schr_k, sirr_k, sseed_k,
+              _divider("divGlare"), glare_on, glint_k, glsize_k] + hidden:
         group.addKnob(k)
+
+    elements.add_element_knobs(group, nuke)
 
     group.addKnob(_divider("creditDivider"))
     group.addKnob(nuke.Text_Knob("credit", "", "<span style='color:#777; font-size:11px;'>"

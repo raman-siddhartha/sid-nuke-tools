@@ -9,6 +9,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.modules.setdefault("nuke", types.ModuleType("nuke"))
 import sid_lens_flare as lf  # noqa: E402
+import sid_flare_elements as fe  # noqa: E402
 
 
 class TclTests(unittest.TestCase):
@@ -26,12 +27,15 @@ class TclTests(unittest.TestCase):
     def test_every_slot_built_and_gated(self):
         for n in range(lf.SLOTS):
             self.assertIn("name g%dConv" % n, self.tcl)
-            self.assertIn("{{parent.ghostCount<=%d}}" % n, self.tcl)
+            self.assertIn("{{parent.ghostCount<=%d||!parent.ghostsOn}}" % n, self.tcl)
             self.assertIn("(parent.ghostCount>%d)*parent.ghostIntensity" % n, self.tcl)
 
     def test_gain_nodes_never_disabled(self):
         # A disabled gain node would pass its unscaled input straight into the sum.
-        for name in ["starGain", "glareGain"] + ["g%dGain" % n for n in range(lf.SLOTS)]:
+        element_gains = ["%sGain" % eid for eid, _l, _f, _s in fe.ELEMENTS if eid not in ("multiIris", "rings")]
+        element_gains += ["multiIrisGain%d" % i for i in range(fe.MULTI_IRIS_SLOTS)]
+        element_gains += ["ringsGain%d" % i for i in range(fe.RING_SLOTS)]
+        for name in ["starGain", "glareGain"] + ["g%dGain" % n for n in range(lf.SLOTS)] + element_gains:
             block = re.search(r"Expression \{[^{}]*(?:\{[^{}]*\}[^{}]*)*name %s\b" % name, self.tcl)
             self.assertIsNotNone(block, name)
             self.assertNotIn("disable", block.group(0), name)
@@ -47,8 +51,24 @@ class TclTests(unittest.TestCase):
     def test_single_tcl_block_has_one_output(self):
         self.assertEqual(self.tcl.count("Output {"), 1)
 
-    def test_spike_gate_has_no_half_line_filter(self):
-        self.assertNotIn("cos(ang-", self.tcl)
+    def test_every_blade_edge_has_two_opposite_half_rays(self):
+        # Odd blades -> 2n spikes needs a ray AND its opposite (+1*pi) per edge,
+        # for each of the 3 wavelength channels.
+        for k in range(12):
+            self.assertEqual(self.tcl.count("+sec/2+%d*sec+0*pi)" % k), 3 * 2)
+            self.assertEqual(self.tcl.count("+sec/2+%d*sec+1*pi)" % k), 3 * 2)
+
+    def test_starburst_length_has_no_pixel_floor(self):
+        # Old bug: max(1,length) made Length 1..10 render identically.
+        end = self.tcl.index("name starKernel")
+        block = self.tcl[self.tcl.rindex("Expression {", 0, end):end]
+        self.assertNotIn("max(1,", block)
+        self.assertIn("parent.starFalloff", block)
+
+    def test_star_shape_knobs_used(self):
+        for knob in ("starThickness", "starFalloff", "starRotation", "starChroma",
+                     "starIrregularity", "starSeed", "starLength"):
+            self.assertIn("parent.%s" % knob, self.tcl, knob)
 
     def test_blades_always_clamped(self):
         self.assertGreater(self.tcl.count("parent.blades"), 0)
@@ -147,6 +167,114 @@ class KnobChangedTests(unittest.TestCase):
         self._fire(types.SimpleNamespace(name=lambda: "fstop"), node)
         self.assertIn("Solve failed", node["status"].value())
         self.assertIn("boom&lt;", node["status"].value())
+
+
+class _FakeKnobBase(object):
+    def __init__(self, name, *args):
+        self._name = name
+        self.args = args
+
+    def name(self):
+        return self._name
+
+    def __getattr__(self, attr):          # setValue, setRange, setFlag, setTooltip, ...
+        return lambda *a, **k: None
+
+
+class _FakeFormat(object):
+    def width(self):
+        return 640
+
+    def height(self):
+        return 360
+
+
+class _FakeNuke(object):
+    """Just enough of the nuke module for _add_knobs: every knob class records
+    its name, so tests can compare created knobs with the TCL's references."""
+    INVISIBLE = NO_ANIMATION = STARTLINE = ENDLINE = 0
+    TABBEGINCLOSEDGROUP = TABBEGINGROUP = TABENDGROUP = 0
+
+    def __getattr__(self, cls):
+        return _FakeKnobBase
+
+
+class _FakeGroup(object):
+    def __init__(self):
+        self.names = []
+        self.knobs = []
+
+    def addKnob(self, k):
+        self.names.append(k.name())
+        self.knobs.append(k)
+
+
+class ElementTests(unittest.TestCase):
+    def setUp(self):
+        self.tcl = lf.build_tcl()
+        saved = lf.nuke
+        lf.nuke = _FakeNuke()
+        try:
+            self.group = _FakeGroup()
+            lf._add_knobs(self.group, 640, 360)
+        finally:
+            lf.nuke = saved
+
+    def test_every_tcl_reference_is_a_created_knob(self):
+        refs = set(re.findall(r"parent\.([A-Za-z_]\w*)", self.tcl))
+        missing = sorted(refs - set(self.group.names))
+        self.assertEqual(missing, [])
+
+    def test_knob_names_unique(self):
+        dupes = sorted(set(n for n in self.group.names if self.group.names.count(n) > 1))
+        self.assertEqual(dupes, [])
+
+    def test_every_element_knob_created_and_used(self):
+        for eid, _l, _f, _s in fe.ELEMENTS:
+            for name in fe.knob_names(eid):
+                self.assertIn(name, self.group.names, name)
+                self.assertIn("parent.%s" % name, self.tcl, name)
+
+    def test_every_element_gated_by_its_switch(self):
+        for eid, _l, _f, _s in fe.ELEMENTS:
+            self.assertIn("!parent.%sOn" % eid, self.tcl, eid)              # expensive nodes disabled
+            self.assertIn("parent.%sOn*" % eid, self.tcl, eid)              # gain multiplied by On
+            self.assertIn("$el_%s" % eid, self.tcl, eid)                    # summed into the flare
+
+    def test_existing_parts_have_switches(self):
+        for knob in ("ghostsOn", "starOn", "glareOn"):
+            self.assertIn(knob, self.group.names)
+            self.assertIn("!parent.%s" % knob, self.tcl)
+            self.assertIn("parent.%s*" % knob, self.tcl)
+
+    def test_elements_default_off(self):
+        by_name = dict((k.name(), k) for k in self.group.knobs)
+        for eid, _l, _f, _s in fe.ELEMENTS:
+            knob = by_name[eid + "On"]
+            self.assertTrue(len(knob.args) > 0 and knob.args[-1] is False, eid)
+
+    def test_every_kernel_has_centre_floor(self):
+        names = ["streakKernel", "spikeBallKernel", "shimmerKernel", "sparkleKernel", "glintKernel",
+                 "irisKernel", "causticKernel"]
+        names += ["multiIrisKernel%d" % i for i in range(fe.MULTI_IRIS_SLOTS)]
+        names += ["ringsKernel%d" % i for i in range(fe.RING_SLOTS)]
+        for name in names:
+            end = self.tcl.index("name %s\n" % name)
+            block = self.tcl[self.tcl.rindex("Expression {", 0, end):end]
+            self.assertIn(fe.CENTRE_FLOOR, block, name)
+
+    def test_expensive_element_nodes_have_disable(self):
+        part = fe.elements_tcl()
+        blocks = re.findall(r"(?:Convolve2|TransformMasked|Blur|Dilate) \{.*?\n\}", part, re.S)
+        self.assertGreater(len(blocks), 20)
+        for b in blocks:
+            self.assertIn("\n disable ", b, b)
+
+    def test_hotspot_only_runs_when_used(self):
+        end = self.tcl.index("name hotSmooth")
+        block = self.tcl[self.tcl.rindex("Blur {", 0, end):end]
+        for eid, _l, _f, _s in fe.ELEMENTS:
+            self.assertIn("(parent.%sOn&&parent.%sSource==1)" % (eid, eid), block)
 
 
 if __name__ == "__main__":
