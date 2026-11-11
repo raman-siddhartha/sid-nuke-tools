@@ -4,8 +4,7 @@ Sid Nuke Tools
 Contents
 --------
 sid_match_tools.py   - Neutralize, Match Black, Match White, Match Colour
-sid_edge_extend.py   - Edge Extend, Alpha Edge, Light Wrap
-sid_edge_extend_blur.py - Edge Extend Blur (Edge Extend + final edge blur)
+sid_edge_extend.py   - Alpha Edge
 sid_lens_flare.py    - Lens Flare (needs sid_lens_optics.py and
                        sid_flare_elements.py next to it)
 menu.py              - registers all of the above under Nodes > Sid
@@ -15,9 +14,9 @@ Install
 1. Copy this whole folder's contents into your Nuke user directory
    (the folder already on NUKE_PATH, usually ~/.nuke), or any folder
    you add to NUKE_PATH.
-2. If you already have a menu.py there, merge the eight lines from this
+2. If you already have a menu.py there, merge the registration lines from this
    one into it instead of overwriting your existing file.
-3. Restart Nuke. Nodes > Sid will list all nine tools.
+3. Restart Nuke. Nodes > Sid will list all six tools.
 
 Match Tools (sid_match_tools.py)
 ---------------------------------
@@ -54,28 +53,11 @@ before. With it on, brightness and saturation-strength are matched as
 two separate quantities, which stays correct even when Target has had
 its Saturation or Gamma adjusted after the original grade.
 
-Edge Extend Tools (sid_edge_extend.py)
-----------------------------------------
-- Edge Extend  : pulls clean colour over a rough alpha edge and
-                  suppresses dark/bright fringing. Four edge-sampling
-                  methods, with an optional Roto Sample input to
-                  source clean colour from a separate plate/roto.
-- Alpha Edge   : alpha-only processor - grow/shrink, edge smoothing,
-                  contrast, and blur.
-- Light Wrap   : wraps background light around a foreground edge, or
-                  composites FG over BG directly, with adjustable
-                  intensity, depth, diffusion, and falloff.
-
-All three take a Mask input and a Mix slider for standard masked/
-partial application.
-
-Edge Extend Blur (sid_edge_extend_blur.py)
---------------------------------------------
-A separate copy of Edge Extend (the original is unchanged) with one
-extra control, Edge Blur, applied as the very last step - after Mask
-& Mix. It blurs RGB only, inside a band around the alpha edge; the
-output alpha is never changed and no colour spills outside the matte.
-Edge Blur moves in 0.1 steps; 0 = off.
+Alpha Edge (sid_edge_extend.py)
+-------------------------------
+Alpha-only processor - grow/shrink, edge smoothing, contrast, and
+blur. Takes a Mask input and a Mix slider for standard masked/partial
+application.
 
 
 Lens Flare (sid_lens_flare.py + sid_lens_optics.py)
