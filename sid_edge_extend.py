@@ -92,13 +92,39 @@ def make_alpha_edge():
             }
             set in_mask [stack 0]
 
+            # Grow / Shrink in sub-pixel steps: Dilate only works in whole pixels, so the matte is the blend of
+            # the two nearest whole-pixel dilations (e.g. 1.3 = 70% of 1px + 30% of 2px).
             push $in_src
             Dilate {
                 channels alpha
-                size {{parent.alphaGrowShrink}}
+                size {{int(parent.alphaGrowShrink)}}
                 name dilNode
                 xpos 0
                 ypos 100
+            }
+            set dil_a [stack 0]
+            push $in_src
+            Dilate {
+                channels alpha
+                size {{int(parent.alphaGrowShrink)+(parent.alphaGrowShrink<0?-1:1)}}
+                name dilNodeNext
+                xpos 150
+                ypos 100
+            }
+            push $dil_a
+            MergeExpression {
+                inputs 2
+                channel0 red
+                expr0 {B.r}
+                channel1 green
+                expr1 {B.g}
+                channel2 blue
+                expr2 {B.b}
+                channel3 alpha
+                expr3 {lerp(B.a,A.a,abs(parent.alphaGrowShrink-int(parent.alphaGrowShrink)))}
+                name growMix
+                xpos 0
+                ypos 130
             }
 
             Blur {
@@ -179,7 +205,7 @@ def make_alpha_edge():
         grow_k = nuke.Double_Knob("alphaGrowShrink", "Grow / Shrink")
         grow_k.setRange(-30.0, 30.0)
         grow_k.setValue(0.0)
-        grow_k.setTooltip("Positive values expand / grow the matte outwards; negative values choke / shrink inwards.")
+        grow_k.setTooltip("Positive values expand / grow the matte outwards; negative values choke / shrink inwards. Works in sub-pixel steps (0.1 px).")
 
         smooth_k = nuke.Double_Knob("alphaSmooth", "Smooth Radius")
         smooth_k.setRange(0.0, 30.0)

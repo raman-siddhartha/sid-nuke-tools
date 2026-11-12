@@ -5,6 +5,7 @@ Contents
 --------
 sid_match_tools.py   - Neutralize, Match Black, Match White, Match Colour
 sid_edge_extend.py   - Alpha Edge
+sid_edge_blur2.py    - Edge Extend Blur 2
 sid_lens_flare.py    - Lens Flare (needs sid_lens_optics.py and
                        sid_flare_elements.py next to it)
 menu.py              - registers all of the above under Nodes > Sid
@@ -16,7 +17,7 @@ Install
    you add to NUKE_PATH.
 2. If you already have a menu.py there, merge the registration lines from this
    one into it instead of overwriting your existing file.
-3. Restart Nuke. Nodes > Sid will list all six tools.
+3. Restart Nuke. Nodes > Sid will list all the tools.
 
 Match Tools (sid_match_tools.py)
 ---------------------------------
@@ -55,10 +56,28 @@ its Saturation or Gamma adjusted after the original grade.
 
 Alpha Edge (sid_edge_extend.py)
 -------------------------------
-Alpha-only processor - grow/shrink, edge smoothing, contrast, and
+Alpha-only processor - grow/shrink (in sub-pixel 0.1 px steps), edge smoothing, contrast, and
 blur. Takes a Mask input and a Mix slider for standard masked/partial
 application.
 
+
+Edge Extend Blur 2 (sid_edge_blur2.py)
+--------------------------------------
+Cleans the RGB edge of a keyed or rotoed element so it blends into a new
+background without a dark or bright rim. Alpha is never changed.
+Inputs: Source, Sample, Mask, Omit.
+- Method: Clean Core Extend, Eroded Inner Ring Sample, or Dark / Bright
+  Fringe Kill Only.
+- Clean Bias, Clear Dark / Clear White and All-Edge Strength set how much of
+  a contaminated edge is replaced. Edge Blend feathers where the cleaned
+  zone meets the original.
+- Recover Grain + Grain Softness bring the original texture back, no blur.
+- Use Sample (checkbox): draw an area on the Sample input and its colour is
+  mixed over Clean Core only inside that area (a KeyMix).
+- Omit: connect an alpha to skip the edge clean there.
+- Show Edge Matte (checkbox) shows the treated band. Edge Blur is a final
+  colour-only blur in 0.1 steps.
+- Premult Input / Output are off by default.
 
 Lens Flare (sid_lens_flare.py + sid_lens_optics.py)
 ------------------------------------------------------
