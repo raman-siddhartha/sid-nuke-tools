@@ -5,10 +5,12 @@ Contents
 --------
 sid_match_tools.py   - Neutralize, Match Black, Match White, Match Colour
 sid_edge_extend.py   - Alpha Edge
-sid_edge_blur.py    - Edge Extend Blur
-sid_light_wrap.py   - Light Wrap
-sid_lens_flare.py    - Lens Flare (needs sid_lens_optics.py and
-                       sid_flare_elements.py next to it)
+sid_edge_blur.py     - Edge Extend Blur
+sid_light_wrap.py    - Light Wrap
+sid_lens_flare.py    - Lens Flare (needs sid_lens_optics.py,
+                       sid_flare_elements.py, sid_flare_dirt.py,
+                       sid_flare_inputs.py and sid_flare_presets.py
+                       next to it)
 menu.py              - registers all of the above under Nodes > Sid
 
 Install
@@ -105,8 +107,8 @@ Inputs: FG, BG, Mask, Normals (optional).
 - The normals come from the alpha and the image luminance, not true depth;
   a real normal map on the Normals input is more accurate.
 
-Lens Flare (sid_lens_flare.py + sid_lens_optics.py)
-------------------------------------------------------
+Lens Flare (sid_lens_flare.py + sid_lens_optics.py + the sid_flare_*.py files)
+--------------------------------------------------------------------------------
 An image-driven, physically traced lens flare. Every highlight in the
 plate flares. Ghosts come from tracing light through a real lens
 prescription: each reflection between two glass surfaces gives a ghost
@@ -125,6 +127,14 @@ even n gives n spikes, odd n gives 2n) and veiling glare.
   animated.
 - Flare Resolution Half (default) renders about 4x faster than Full.
 - Output: Flare over Plate, Flare Only, Highlights, Aperture.
+- Preset row (Lens tab): four built-in looks (Clean Prime, Vintage
+  Uncoated, Anamorphic Sci-Fi, Sun Flare) plus your own, which are saved
+  as JSON files in ~/.nuke/sid_flare_presets. Applying a preset re-traces
+  the lens once.
+- Squeeze (Aperture section, up to 2x) stretches the aperture-shaped
+  ghosts, Iris, Multi-Iris, Caustic and Ring / Halo (Light) into ovals
+  the way an anamorphic lens does; above 1x the first Streak gets a blue
+  default.
 - Tests: python -m unittest discover -s tests   (no Nuke needed)
          Nuke17.1.exe --nc -t tests/nuke_flare_check.py   (inside Nuke)
 
@@ -132,7 +142,9 @@ Lens Flare panel tabs
 - Lens: lens, F-Stop, sensor, source threshold/gain, aperture, output.
   Overscan % (default 25) pads the working canvas so shapes are not
   cropped at the frame edge and light does not wrap across it.
-- Ghosts & Glare: Ghosts, Starburst and Veiling Glare, each with its
+- Ghosts & Glare: Master (Intensity, Saturation, Tint, Flicker Amount /
+  Speed / Seed), then Ghosts,
+  Starburst and Veiling Glare, each with its
   own on/off switch. Starburst shape: Length (plate px at f/4, no
   minimum), Thickness, Falloff (1 soft tail, 2 Gaussian, higher = hard
   needle), Rotation, Chromatic Spread, Irregularity + Seed.
@@ -169,3 +181,32 @@ Lens Flare panel tabs
   Use Offset (per element, off by default) shows that element's Offset
   handle and moves it in plate px on top of its physical position; the
   handles of elements you are not moving stay hidden.
+
+Lens Dirt (Dirt tab)
+  Dirt on the lens, lit by the flare: the flare and the bright highlights
+  are blurred (Spread, Response) and multiplied by the dirt, so dirt only
+  shows where light hits it. Added before Master.
+  - Source: Procedural or Input texture (Fill / Fit). Connecting the Dirt
+    input appears when Input texture is chosen.
+  - Procedural layers, each with its own Enable (all off), Amount, Count,
+    Size, Softness, Variation and Use Breakup: Specks, Smudges, Floaters,
+    Fibres, Scratches, Fingerprint.
+  - Placement: All over, Centre, Edges or Mask (plus Invert). The DirtMask
+    input appears when Mask is chosen.
+  - Breakup and Internal Breakup: fractal noise with Type, Size, Z,
+    Octaves, Lacunarity, Gain, Gamma, Translate; a global Softness.
+
+Custom shape inputs (Lens Flare)
+  Optional inputs that exist only while chosen, so the node has no unused
+  pipes. Connect an image and its shape is used instead of the procedural
+  one; unconnected = procedural (a Status line says so).
+  - Caustic: Caustic Shape = Input.
+  - Ring: Rings or Ring / Halo Shape = Input.
+  - Aperture: Aperture Shape = Input (ghosts, Iris, Multi-Iris).
+  Image kernels are centred on the pixel and keep their colour balance.
+
+Line elements (Streak, Spike Ball, Shimmer, Sparkle, Glint)
+  Thickness and Softness use an exact coverage profile, so thin lines do
+  not vanish. Multi-Streak: up to 8 streaks (Streak Count with + / -
+  buttons), each slot with its own settings and offset. Shimmer has a
+  Speed for the flicker.

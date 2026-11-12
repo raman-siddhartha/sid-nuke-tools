@@ -5,8 +5,8 @@
 # (sid_lens_optics.py); each ghost is the highlights remapped through that
 # reflection path and convolved with the actual aperture shape.
 #
-# Non-Commercial safe: the whole internal graph is built by ONE nuke.tcl()
-# call and Python never looks up nodes inside the Group -- it only reads and
+# The whole internal graph is built by ONE nuke.tcl() call and Python never
+# looks up nodes inside the Group -- it only reads and
 # writes the Group's own knobs, which internal nodes follow via parent.*
 # expressions. TCL {{ }} expressions contain no spaces (Nuke splits on them).
 #
@@ -20,14 +20,17 @@ import nuke
 
 import sid_lens_optics as optics
 import sid_flare_elements as elements
+import sid_flare_dirt as dirt
+import sid_flare_inputs as inputs
+import sid_flare_presets as presets
 
 SLOTS = optics.MAX_GHOST_SLOTS
 RES = "pow(0.5,parent.flareRes)"          # Full=1, Half=0.5, Quarter=0.25
 SLOT_KNOB_SUFFIXES = ("sR", "sG", "sB", "rad", "eR", "eG", "eB")
+INPUT_KNOBS = ("dirtTexture", "dirtPlacement", "causticShape", "ringsShape", "ringHaloShape", "apShape")
 SOLVE_KNOBS = ("lensPreset", "customPrescription", "fstop", "ghostCount", "coatings")
 CUSTOM = "Custom"
 REF_FSTOP = 4.0           # Starburst Length is defined at f/4 (spikes lengthen as you stop down)
-AA_SIGMA_PX = 0.35        # minimum spike sigma (working px) so sub-pixel spikes don't alias
 MAX_RAYS = 24             # 12 blade edges x 2 half-rays
 BLADES = "clamp(parent.blades,3,12)"   # every TCL use of the Blades knob goes through this
 
@@ -85,16 +88,21 @@ def _ghost_tcl(n):
     u, band = elements.filled_band("ghosts")
     lines = elements.coloured_kernel_lines("ghosts", elements.shape_temps(radius),
                                            elements.iris_shape("0.5"), u, band, "aw", n)
-    out.append("push $hl\nExpression {\n%s\n disable %s\n name g%dAperture\n}"
-               % ("\n".join(elements.with_floor(lines)), off, n))
+    kernel = ("push $hl\nExpression {\n%s\n disable %s\n name g%dAperture\n}"
+              % ("\n".join(elements.with_floor(lines)), off, n))
+    active = elements.custom_active("apShape", "Aperture")
+    out.append(elements.pick_kernel_tcl("g%d" % n, kernel,
+                                        elements.custom_kernel_tcl("ghosts", "g%d" % n, "in_aperture", radius, off_inner,
+                                                                   active, True), active))
     out.append("set g%dK [stack 0]" % n)
     out.append(elements.coloured_conv_tcl("ghosts", "g%dK" % n, "g%dsrc" % n, off_inner, "g%d" % n))
-    bal = elements.balance_refs("ghosts")
+    bal = tuple("((%s)?1:%s)" % (active, b) for b in elements.balance_refs("ghosts"))     # an image kernel brings its own
     out.append(
         "Expression {\n"
         " temp_name0 on\n temp_expr0 {parent.ghostsOn*(parent.ghostCount>%d)*parent.ghostIntensity}\n"
         " expr0 {r*on*parent.g%deR*%s}\n expr1 {g*on*parent.g%deG*%s}\n expr2 {b*on*parent.g%deB*%s}\n expr3 0\n"
         " name g%dGain\n}" % (n, n, bal[0], n, bal[1], n, bal[2], n))
+    out.append(elements.custom_balance_tcl("ghosts", "g%d" % n, "in_aperture", active))
     out.append("set g%d [stack 0]" % n)
     return "\n".join(out)
 
@@ -123,7 +131,8 @@ def _spike_sum(length_px_expr):
     blades): for each blade edge a ray along its normal and one opposite.
     Odd blade counts give 2n distinct spikes; even counts give n, as
     opposite rays coincide (Convolve2 normalize removes the doubling).
-    Per ray: Gaussian cross-section (temp `sw`, Thickness), fall-off
+    Per ray: line coverage across (Thickness core, Softness edge; flareGeo
+    knobs *_star, see sid_flare_elements.profile), fall-off
     exp(-(r/L)^Falloff) with L = `length_px_expr`, and Irregularity
     randomising each ray's length and brightness (Seed)."""
     rot = "(parent.apRotation+parent.starRotation)*pi/180"
@@ -134,29 +143,33 @@ def _spike_sum(length_px_expr):
         ray_len = "max(0.01,(%s)*max(0.05,1+parent.starIrregularity*(2*%s-1)))" % (
             length_px_expr, _hash(j, 12.9898, 78.233))
         bright = "(1-0.8*parent.starIrregularity*%s)" % _hash(j, 39.3467, 11.135)
+        across = elements.profile("rad*sin(ang-%s)" % th, "star")
         terms.append(
-            "(%d<%s)*(cos(ang-%s)>0)*%s*exp(-pow(rad*sin(ang-%s)/sw,2)/2)"
+            "(%d<%s)*(cos(ang-%s)>0)*%s*%s"
             "*exp(-pow(rad/%s,max(0.2,parent.starFalloff)))"
-            % (k, BLADES, th, bright, th, ray_len))
+            % (k, BLADES, th, bright, across, ray_len))
     return "(rad<0.5?0:%s)" % "+".join(terms)
 
 
 def _starburst_tcl():
     """Analytic diffraction kernel (wavelength-scaled per channel), convolved
     with the highlights one channel at a time. Length and Thickness are in
-    plate px, converted to the working resolution here."""
+    plate px, converted to the working resolution here (the profile
+    constants are the flareGeo knobs *_star)."""
     lines = ["push $hl", "Expression {",
-             " temp_name0 rad", " temp_expr0 {hypot(x+0.5-width/2,y+0.5-height/2)}",
-             " temp_name1 ang", " temp_expr1 {atan2(y+0.5-height/2,x+0.5-width/2)}",
-             " temp_name2 sec", " temp_expr2 {2*pi/" + BLADES + "}",
-             " temp_name3 sw",
-             " temp_expr3 {hypot(parent.starThickness*%s/2.355,%g)}" % (RES, AA_SIGMA_PX)]
+             " temp_name0 rad", " temp_expr0 {hypot(%s,%s)}" % (elements.KDX, elements.KDY),
+             " temp_name1 ang", " temp_expr1 {atan2(%s,%s)}" % (elements.KDY, elements.KDX),
+             " temp_name2 sec", " temp_expr2 {2*pi/" + BLADES + "}"]
+    kernel = []
     for i, w in enumerate(optics.WAVELENGTHS_UM):
         chroma = w / optics.WAVELENGTHS_UM[1] - 1.0
         length = "parent.starLength*%s*parent.effFstop/%g*(1+parent.starChroma*%.4f)" % (
             RES, REF_FSTOP, chroma)
-        lines.append(" expr%d {%s}" % (i, _spike_sum(length)))
-    lines += [" expr3 0", " disable {{parent.starIntensity<=0||!parent.starOn}}", " name starKernel", "}",
+        kernel.append(" expr%d {%s}" % (i, _spike_sum(length)))
+    # CENTRE_FLOOR keeps the kernel sum > 0 (Convolve2 normalize divides by it)
+    # even when every spike underflows (huge Falloff, tiny Length).
+    lines += elements.with_floor(kernel)
+    lines += [" expr3 0"," disable {{parent.starIntensity<=0||!parent.starOn}}", " name starKernel", "}",
               "set starK [stack 0]", "push $hl", "set star_in [stack 0]"]
     for ch in ("red", "green", "blue"):
         lines += ["push $starK", "push $star_in",
@@ -169,19 +182,34 @@ def _starburst_tcl():
     return "\n".join(lines)
 
 
+def _master_tcl():
+    """Master on the summed flare (before the overscan crop): Saturation about
+    the luminance (clamped >= 0, the flare is added to the plate), Intensity,
+    Tint and the flicker gain (flareGeo.fl_<c>, exactly 1 at Amount and
+    Colour Jitter 0). A gain node, never disabled."""
+    rows = []
+    for i, ch in enumerate("rgb"):
+        rows.append(" expr%d {max(0,lerp(lm,%s,parent.masterSaturation))*parent.masterIntensity"
+                    "*parent.masterTint.%s*%s.fl_%s}" % (i, ch, ch, elements.GEO, ch))
+    return ("push $acc\nExpression {\n temp_name0 lm\n temp_expr0 {0.2126*r+0.7152*g+0.0722*b}\n%s\n"
+            " expr3 {a}\n name masterGain\n}" % "\n".join(rows))
+
+
 def build_tcl():
     """Whole internal graph as TCL. Order: highlights -> Reformat down ->
     overscan pad ($hl: the padded, downscaled highlight stream every branch
     reads) -> ghost slots, starburst, glare, hotspot + flare elements
-    (sid_flare_elements) -> summed -> overscan crop -> Reformat up -> Crop
+    (sid_flare_elements) -> summed -> Lens Dirt (sid_flare_dirt, lit by the sum) -> overscan crop -> Reformat up -> Crop
     (bbox clamped to the frame) -> merged over the plate -> output switch ->
-    mask mix. The flareGeo NoOp (sid_flare_elements.geo_tcl) sits after the
-    pad and holds the per-frame constants every branch reads."""
+    mask mix. Master (intensity, tint, saturation, flicker) is applied to the
+    sum just before the crop. The flareGeo NoOp (sid_flare_elements.geo_tcl)
+    sits after the pad and holds the per-frame constants every branch reads."""
     parts = ["""
 Input { inputs 0 name Source xpos 0 ypos 0 }
 set in_src [stack 0]
 Input { inputs 0 name Mask number 1 xpos 400 ypos 0 }
 set in_mask [stack 0]
+""" + inputs.placeholders_tcl() + """
 
 push $in_src
 Expression {
@@ -220,6 +248,7 @@ AdjBBox {
 }
 set hl [stack 0]
 """ + elements.geo_tcl() + """
+""" + elements.mean_colour_tcl() + """
 push $hl
 """ + elements.light_colour_tcl("ghosts", "ghostsLight") + """
 set ghl [stack 0]
@@ -251,8 +280,11 @@ set glare [stack 0]
         parts.append("push %s\npush %s\nMerge2 { inputs 2 operation plus also_merge all }\nset acc [stack 0]"
                      % (src, acc))
         acc = "$acc"
+    parts.append(dirt.dirt_tcl(acc))
+    parts.append("push $dirtGlow\npush %s\nMerge2 { inputs 2 operation plus also_merge all name dirtAdd }\nset acc [stack 0]"
+                 % acc)
+    parts.append(_master_tcl())
     parts.append("""
-push $acc
 Reformat {
  type "to box"
  box_width {{flareDown.width}}
@@ -340,6 +372,23 @@ def _heading(name, label):
     return nuke.Text_Knob(name, "<b>%s</b>" % label, "")
 
 
+def _master_knobs():
+    """Master section at the top of the Ghosts & Glare tab."""
+    inten = _double("masterIntensity", "Master Intensity", 0.0, 4.0, 1.0, "Scales the whole flare.")
+    tint = nuke.Color_Knob("masterTint", "Master Tint")
+    tint.setValue([1.0, 1.0, 1.0])
+    sat = _double("masterSaturation", "Master Saturation", 0.0, 2.0, 1.0, "0 = grey flare, 1 = as is, 2 = double.")
+    amt = _double("flickerAmount", "Flicker Amount", 0.0, 1.0, 0.0,
+                  "Random brightness flicker of the whole flare over time; 0 = steady.")
+    spd = _double("flickerSpeed", "Flicker Speed", 0.0, 20.0, 4.0, "How fast the flicker changes.")
+    jit = _double("flickerJitter", "Colour Jitter", 0.0, 1.0, 0.0,
+                  "Independent flicker per colour channel; 0 = brightness only.")
+    seed = nuke.Int_Knob("flickerSeed", "Flicker Seed")
+    seed.setValue(0)
+    seed.setTooltip("Re-rolls the flicker pattern.")
+    return [_heading("hdrMaster", "Master"), inten, tint, sat, amt, spd, jit, seed]
+
+
 def _add_knobs(group, width, height):
     preset_k = nuke.Enumeration_Knob("lensPreset", "Lens", list(optics.PRESET_NAMES) + [CUSTOM])
     custom_k = nuke.Multiline_Eval_String_Knob("customPrescription", "Custom Prescription")
@@ -366,6 +415,16 @@ def _add_knobs(group, width, height):
     blades_k.setRange(3, 12)
     round_k = _double("apRoundness", "Roundness", 0.0, 1.0, 0.1)
     rot_k = _double("apRotation", "Rotation", -180.0, 180.0, 0.0)
+    apshape_k = nuke.Enumeration_Knob("apShape", "Aperture Shape", ["Procedural", "Input"])
+    apshape_k.setTooltip("Procedural: the n-blade polygon. Input: use the image on the Aperture input, which appears on "
+                         "the node while Input is chosen, as the aperture of the ghosts, Iris and Multi-Iris (luminance "
+                         "= shape, colour = colour). The Starburst keeps the blade-count diffraction: a true diffraction "
+                         "pattern of an arbitrary image needs an FFT that Nuke does not provide. Nothing connected = "
+                         "the n-blade polygon.")
+    squeeze_k = nuke.Enumeration_Knob("squeeze", "Squeeze", elements.SQUEEZES)
+    squeeze_k.setTooltip("Anamorphic squeeze: stretches the aperture-shaped ghosts, Iris, Multi-Iris, Caustic and "
+                         "Ring / Halo (Light) into ovals, 1/Squeeze as wide as tall. Above 1x the first Streak gets "
+                         "the blue anamorphic tint (only while it is untouched).")
 
     count_k = nuke.Int_Knob("ghostCount", "Ghost Count")
     count_k.setValue(8)
@@ -374,14 +433,16 @@ def _add_knobs(group, width, height):
     disp_k = _double("dispersion", "Dispersion", 0.0, 2.0, 1.0, "1 = physical glass dispersion, 0 = none.")
     count_k.setTooltip("Number of ghosts (brightest first)." + noanim)
     count_k.setFlag(nuke.NO_ANIMATION)
-    coat_k = nuke.Boolean_Knob("coatings", "Coatings", True)
+    coat_k = elements.bool_knob(nuke, "coatings", "Coatings", True)
     coat_k.setTooltip("Anti-reflection coatings on the surfaces marked coated." + noanim)
     coat_k.setFlag(nuke.NO_ANIMATION)
 
     sint_k = _double("starIntensity", "Starburst Intensity", 0.0, 0.5, 0.02)
     slen_k = _double("starLength", "Length", 0.5, 1000.0, 60.0,
                      "Spike length in plate pixels at f/4 (spikes lengthen as you stop down).")
-    sthk_k = _double("starThickness", "Thickness", 0.5, 20.0, 2.0, "Spike width in plate pixels.")
+    sthk_k = _double("starThickness", "Thickness", 0.5, 20.0, 2.0, "Solid core width of the spikes in plate pixels.")
+    ssoft_k = _double("starSoftness", "Softness", 0.0, 20.0, 1.2,
+                      "Edge falloff width of the spikes in plate pixels (0 = crisp edge).")
     sfall_k = _double("starFalloff", "Falloff", 0.3, 8.0, 1.0,
                       "How spikes fade: 1 = soft exponential tail, 2 = Gaussian, higher = hard-ended needle.")
     srot_k = _double("starRotation", "Rotation", -180.0, 180.0, 0.0,
@@ -393,7 +454,7 @@ def _add_knobs(group, width, height):
     sseed_k = nuke.Int_Knob("starSeed", "Seed")
     sseed_k.setValue(0)
     sseed_k.setTooltip("Re-rolls the Irregularity pattern.")
-    glint_k = _double("glareIntensity", "Glare Intensity", 0.0, 0.0005, 0.00001,
+    glint_k = _double("glareIntensity", "Glare Intensity", 0.0, 0.1, 0.00001,
                       "Tiny values are normal: highlights are already lifted by Source Gain (2^stops).")
     glsize_k = _double("glareSize", "Glare Size", 10.0, 1000.0, 200.0)
 
@@ -406,6 +467,7 @@ def _add_knobs(group, width, height):
     mix_k = _double("mix", "Mix", 0.0, 1.0, 1.0)
     mix_k.clearFlag(nuke.STARTLINE)
     status_k = nuke.Text_Knob("status", "Status", "(not solved)")
+    note_k = nuke.Text_Knob("inputsNote", "", "")
 
     hidden = []
     for n in range(SLOTS):
@@ -420,25 +482,26 @@ def _add_knobs(group, width, height):
     eff_k.setFlag(nuke.INVISIBLE)
     hidden.append(eff_k)
 
-    ghosts_on = nuke.Boolean_Knob("ghostsOn", "Ghosts", True)
-    star_on = nuke.Boolean_Knob("starOn", "Starburst", True)
-    glare_on = nuke.Boolean_Knob("glareOn", "Veiling Glare", True)
+    ghosts_on = elements.bool_knob(nuke, "ghostsOn", "Ghosts", True)
+    star_on = elements.bool_knob(nuke, "starOn", "Starburst", True)
+    glare_on = elements.bool_knob(nuke, "glareOn", "Veiling Glare", True)
     overscan_k = _double("overscan", "Overscan %", 0.0, 100.0, 25.0,
                          "Extra canvas around the frame (per side) so shapes are not cropped at the "
                          "frame edge and light does not wrap across it. Costs render time: "
                          "25% is about 2.25x the canvas area.")
 
-    lens_tab = [nuke.Tab_Knob("tabLens", "Lens"),
+    lens_tab = [nuke.Tab_Knob("tabLens", "Lens")] + presets.row_knobs(nuke) + [
                 preset_k, custom_k, fstop_k, sensor_k,
                 _divider("divSrc"), _heading("hdrSrc", "Source"), thr_k, knee_k, stops_k,
-                _divider("divAp"), _heading("hdrAp", "Aperture"), blades_k, round_k, rot_k,
+                _divider("divAp"), _heading("hdrAp", "Aperture"), blades_k, round_k, rot_k, apshape_k, squeeze_k,
                 _divider("divOut"), _heading("hdrOut", "Output"), res_k, overscan_k, mode_k, inv_k, mix_k,
-                status_k]
-    ghosts_tab = ([nuke.Tab_Knob("tabGhosts", "Ghosts & Glare"),
-                   ghosts_on, count_k, gint_k, disp_k, coat_k]
+                status_k, note_k]
+    ghosts_tab = ([nuke.Tab_Knob("tabGhosts", "Ghosts & Glare")]
+                  + _master_knobs()
+                  + [_divider("divGhosts"), ghosts_on, count_k, gint_k, disp_k, coat_k]
                   + elements.colour_knobs(nuke, "ghosts")
                   + elements.offset_knobs(nuke, "ghosts")
-                  + [_divider("divStar"), star_on, sint_k, slen_k, sthk_k, sfall_k,
+                  + [_divider("divStar"), star_on, sint_k, slen_k, sthk_k, ssoft_k, sfall_k,
                      srot_k, schr_k, sirr_k, sseed_k]
                   + elements.offset_knobs(nuke, "star")
                   + [_divider("divGlare"), glare_on, glint_k, glsize_k])
@@ -446,6 +509,7 @@ def _add_knobs(group, width, height):
         group.addKnob(k)
 
     elements.add_element_knobs(group, nuke, center_k)
+    dirt.add_dirt_knobs(group, nuke, width, height)
 
     group.addKnob(_divider("creditDivider"))
     group.addKnob(nuke.Text_Knob("credit", "", "<span style='color:#777; font-size:11px;'>"
@@ -492,10 +556,41 @@ def solve(group):
     group["status"].setValue(msg)
 
 
+def finish_preset(group):
+    """After a preset was applied (callbacks muted): re-trace the lens, redraw the Offset handles and recreate the
+    optional input pipes once."""
+    solve(group)
+    elements.sync_offset_visibility(group)
+    inputs.sync(group)
+
+
 def _on_knob_changed():
+    if presets.muted():
+        return
     k = nuke.thisKnob()
-    if k is not None and k.name().endswith("OffsetOn"):
-        elements.sync_offset_visibility(nuke.thisNode(), k.name()[:-len("OffsetOn")])
+    if k is not None and (k.name().endswith("OffsetOn") or k.name() == "streakCount"):
+        try:
+            if k.name() == "streakCount":
+                elements.sync_offset_visibility(nuke.thisNode())
+            else:
+                elements.sync_offset_visibility(nuke.thisNode(), k.name()[:-len("OffsetOn")])
+        except Exception as err:
+            print("Lens Flare: could not update knob visibility: %s" % err)
+        return
+    if k is not None and k.name() == "squeeze":
+        try:
+            elements.squeeze_streak_defaults(nuke.thisNode())
+        except Exception as err:
+            print("Lens Flare: could not update the Streak default: %s" % err)
+        return
+    if k is not None and (k.name() in INPUT_KNOBS or k.name() == "inputChange"):
+        try:
+            if k.name() == "inputChange":
+                inputs.update_note(nuke.thisNode())
+            else:
+                inputs.sync(nuke.thisNode())
+        except Exception as err:
+            print("Lens Flare: could not update the optional inputs: %s" % err)
         return
     if k is not None and k.name() in SOLVE_KNOBS:
         node = nuke.thisNode()
@@ -522,11 +617,18 @@ def make_lens_flare():
     group.setName("LensFlare")
     with group:
         nuke.tcl(build_tcl())
+    before = set(group.knobs())
     _add_knobs(group, width, height)
+    presets.record_knobs(group, before)
+    presets.refresh_menu(group)
+    elements.sync_offset_visibility(group)
     group["knobChanged"].setValue("import sid_lens_flare\nsid_lens_flare._on_knob_changed()\n")
-    # Knob visibility is not saved with the script: re-apply it when the script loads.
+    # Knob visibility is not saved with the script: re-apply it (Use Offset and
+    # the streak slots) when the script loads.
     group["onCreate"].setValue("import sid_flare_elements\n"
-                               "sid_flare_elements.sync_offset_visibility(nuke.thisNode())\n")
+                               "sid_flare_elements.sync_offset_visibility(nuke.thisNode())\n"
+                               "import sid_flare_presets\n"
+                               "sid_flare_presets.refresh_menu(nuke.thisNode())\n")
     solve(group)
     group["label"].setValue("[value lensPreset]  f/[value effFstop]")
     if selected is not None:

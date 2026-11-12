@@ -1,7 +1,7 @@
-# Sid Lens Flare -- flare elements (v3).
+# Sid Lens Flare -- flare elements (v4).
 #
 # Switchable elements of the Lens Flare node:
-#   centred on each light : Streak, Spike Ball, Shimmer, Sparkle, Glint, Bloom
+#   centred on each light : Streak (up to 8 slots), Spike Ball, Shimmer, Sparkle, Glint, Bloom
 #   along the flare axis  : Iris, Multi-Iris, Rings, Caustic
 #   ring                  : Ring / Halo (around the optical centre or each light)
 #   fixed to the glass    : Lens Orbs, Overscreen Wash
@@ -20,6 +20,15 @@
 # Width, Light Colour, Noise. Coloured modes use an RGB kernel and one
 # Convolve2 per channel; Tint keeps the single alpha Convolve2.
 #
+# Line profile (v4): every line / ring shape (Streak, Spike Ball, Shimmer,
+# Sparkle, Glint spikes, Starburst spikes, Rings, Ring / Halo) has the
+# cross-section p(d) = clamp((T/2-|d|)/max(AA,S)+0.5,0,1): Thickness T is the
+# solid core width, Softness S the edge falloff width. The kernel stores its
+# exact pixel coverage (p integrated over the 1 working px pixel box, see
+# profile()), not p sampled at the pixel centre: a point-sampled line thinner
+# than ~1 px falls between pixels (BF-12). The constants it needs (hw, sf, hp,
+# hm, kq, wi) live on flareGeo, per prefix.
+#
 # Rules: TCL generators are pure string functions; the graph is built in the
 # node's single nuke.tcl() call; no internal node lookups from Python; no
 # space inside any single {{...}}; temp names never r/g/b/a/x/y/z; gain nodes
@@ -28,7 +37,6 @@
 #
 # Strict ASCII.
 
-import math
 
 RES = "pow(0.5,parent.flareRes)"          # plate px -> working px
 OS = "parent.overscan/100"
@@ -56,15 +64,31 @@ WASH_REF_PX = 800.0                       # Wash even-field reference spread (pl
 MULTI_IRIS_SLOTS = 8
 RING_SLOTS = 4
 MAX_SPIKE_RAYS = 64
-MAX_SPARKLE_POINTS = 8
+MAX_SPARKLE_POINTS = 32
+SPARKLE_POINTS = (4, 6, 8, 16, 32)       # Points enum index -> number of points
+MAX_SHIMMER_RAYS = 128
+STREAK_SLOTS = 8
+# Default Angle per streak slot, so a slot added with + does not sit on top of
+# the ones before it.
+STREAK_DEFAULT_ANGLES = (0.0, 90.0, 45.0, 135.0, 22.5, 112.5, 67.5, 157.5)
 MAX_ORBS = 64
+
+# Kernel centre (BF-12b). Convolve2 puts a kernel's origin on the pixel with
+# index floor(width/2), floor(height/2) (measured in Nuke 17.1 on even and odd
+# formats from 8x6 to 2048x858), i.e. on that pixel's CENTRE. Every kernel is
+# drawn about it: dx, dy are pixel offsets from that pixel (pixel centre x+0.5
+# minus (floor(width/2)+0.5)). The old x+0.5-width/2 was the pixel boundary on
+# even canvases, half a pixel off (output shifted by -0.5 working px) and a
+# 1 px line fell between two rows.
+KDX = "(x-floor(width/2))"
+KDY = "(y-floor(height/2))"
 
 # Added to every kernel channel that is normalized (alpha of mono kernels;
 # r, g, b and alpha of coloured kernels) so the centre pixel(s) always carry
 # a tiny weight: Convolve2 normalize divides each channel by that kernel
 # channel's sum, and a zero-sum channel (a ring larger than the canvas, or a
 # colour with no green) would blow up.
-CENTRE_FLOOR = ("((x+0.5-width/2)*(x+0.5-width/2)+(y+0.5-height/2)*(y+0.5-height/2)<1?0.000001:0)")
+CENTRE_FLOOR = ("((%s)*(%s)+(%s)*(%s)<1?0.000001:0)" % (KDX, KDX, KDY, KDY))
 
 SOURCES = ["All highlights", "Hotspot"]
 
@@ -92,34 +116,43 @@ COLOURED = ("iris", "multiIris", "rings", "caustic", "ringHalo")
 # Extra controls per element: (knob suffix, label, kind, lo, hi, default, tooltip)
 # kind: "d" Double, "i" Int, "e:<a|b|c>" Enumeration.
 EXTRA = {
+    # Per streak slot (knobs streak0Length ... streak7Length, see streak_slot_knob_names()).
     "streak": (
-        ("Length", "Length", "d", 1, 2000, 300, "Half-length in plate px."),
-        ("Thickness", "Thickness", "d", 0.5, 40, 3, "Width in plate px."),
         ("Angle", "Angle", "d", -180, 180, 0, "0 = horizontal (anamorphic)."),
+        ("Length", "Length", "d", 1, 2000, 300, "Half-length in plate px."),
+        ("Thickness", "Thickness", "d", 0.5, 40, 3, "Solid core width in plate px."),
+        ("Softness", "Softness", "d", 0, 40, 1.8, "Edge falloff width in plate px (0 = crisp edge)."),
         ("Falloff", "Falloff", "d", 0.3, 8, 1, "1 = soft tail, 2 = Gaussian, higher = hard end."),
     ),
     "spikeBall": (
-        ("Rays", "Rays", "i", 8, MAX_SPIKE_RAYS, 32, "Number of rays. Max 64."),
+        ("Rays", "Rays", "i", 8, MAX_SPIKE_RAYS, 32, "Number of rays. Max %d." % MAX_SPIKE_RAYS),
         ("Length", "Length", "d", 1, 1000, 120, "Plate px."),
         ("Variation", "Length Variation", "d", 0, 1, 0.6, None),
-        ("Thickness", "Thickness", "d", 0.5, 10, 1, "Plate px."),
+        ("Thickness", "Thickness", "d", 0.5, 10, 1, "Solid core width in plate px."),
+        ("Softness", "Softness", "d", 0, 10, 0.6, "Edge falloff width in plate px (0 = crisp edge)."),
         ("Seed", "Seed", "i", 0, 9999, 0, None),
     ),
     "shimmer": (
-        ("Rays", "Rays", "d", 16, 128, 48, "Angular detail of the rays."),
+        ("Rays", "Rays", "i", 16, MAX_SHIMMER_RAYS, 48, "Number of thin rays at random angles. Max %d." % MAX_SHIMMER_RAYS),
         ("Length", "Length", "d", 1, 1000, 150, "Plate px."),
-        ("Speed", "Speed", "d", 0, 10, 1, "Flicker speed; 0 = static."),
-        ("Seed", "Seed", "i", 0, 9999, 0, None),
+        ("Thickness", "Thickness", "d", 0.5, 10, 1, "Solid core width in plate px."),
+        ("Softness", "Softness", "d", 0, 10, 0.6, "Edge falloff width in plate px (0 = crisp edge)."),
+        ("Speed", "Speed", "d", 0, 10, 1, "Flicker speed of each ray's brightness; 0 = static."),
+        ("Seed", "Seed", "i", 0, 9999, 0, "Re-rolls the ray angles and flicker."),
     ),
     "sparkle": (
-        ("Points", "Points", "e:4|6|8", 0, 0, 0, None),
+        ("Points", "Points", "e:4|6|8|16|32", 0, 0, 0, None),
         ("Size", "Size", "d", 1, 400, 40, "Plate px."),
+        ("Thickness", "Thickness", "d", 0.5, 20, 2.8, "Solid core width of the rays in plate px."),
+        ("Softness", "Softness", "d", 0, 20, 1.7, "Edge falloff width in plate px (0 = crisp edge)."),
         ("Rotation", "Rotation", "d", -180, 180, 0, None),
         ("Speed", "Twinkle Speed", "d", 0, 10, 0, "0 = static."),
     ),
     "glint": (
         ("Size", "Size", "d", 0.5, 100, 6, "Core size in plate px."),
         ("SpikeLength", "Spike Length", "d", 1, 500, 40, "Plate px."),
+        ("Thickness", "Thickness", "d", 0.5, 20, 2.4, "Solid core width of the spikes in plate px."),
+        ("Softness", "Softness", "d", 0, 20, 1.4, "Edge falloff width in plate px (0 = crisp edge)."),
         ("Angle", "Angle", "d", -180, 180, 45, None),
     ),
     "bloom": (
@@ -132,7 +165,7 @@ EXTRA = {
         ("Softness", "Softness", "d", 0, 50, 1, "Edge softness in plate px."),
     ),
     "multiIris": (
-        ("Count", "Count", "i", 1, MULTI_IRIS_SLOTS, 5, "Number of irises. Max 8."),
+        ("Count", "Count", "i", 1, MULTI_IRIS_SLOTS, 5, "Number of irises. Max %d." % MULTI_IRIS_SLOTS),
         ("Spread", "Spread", "d", 0, 2, 1.2, "Positions are spread over -Spread..+Spread along the axis."),
         ("SizeMin", "Size Min", "d", 1, 1000, 15, "Plate px at f/2.8. Shapes larger than the canvas are capped."),
         ("SizeMax", "Size Max", "d", 1, 1000, 70, "Plate px at f/2.8. Shapes larger than the canvas are capped."),
@@ -140,29 +173,42 @@ EXTRA = {
         ("Seed", "Seed", "i", 0, 9999, 0, None),
     ),
     "rings": (
-        ("Count", "Count", "i", 1, RING_SLOTS, 2, "Number of rings. Max 4."),
+        ("Shape", "Shape", "e:Procedural|Input", 0, 0, 0,
+         "Procedural: drawn rings. Input: use the image on the Ring input, which appears on the node while Input is "
+         "chosen, as the ring shape (luminance = shape, colour = colour; Thickness and Softness no longer apply; "
+         "nothing connected = procedural)."),
+        ("Count", "Count", "i", 1, RING_SLOTS, 2, "Number of rings. Max %d." % RING_SLOTS),
         ("Position", "Position", "d", -2, 2, -0.9, "First ring along the flare axis."),
         ("Spacing", "Spacing", "d", -1, 1, 0.25, "Axis distance between rings."),
         ("Radius", "Radius", "d", 2, 1500, 120, "Plate px. Shapes larger than the canvas are capped."),
-        ("Thickness", "Thickness", "d", 0.5, 50, 3, "Plate px."),
+        ("Thickness", "Thickness", "d", 0.5, 50, 12, "Solid core width in plate px."),
+        ("Softness", "Softness", "d", 0, 50, 6, "Edge falloff width in plate px (0 = crisp edge)."),
     ),
     "caustic": (
+        ("Shape", "Shape", "e:Procedural|Input", 0, 0, 0,
+         "Procedural: the cusped caustic. Input: use the image on the Caustic input, which appears on the node while "
+         "Input is chosen, as the shape (luminance = shape, colour = colour; nothing connected = procedural)."),
         ("Position", "Position", "d", -2, 2, -0.3, None),
         ("Size", "Size", "d", 2, 1000, 90, "Radius in plate px. Shapes larger than the canvas are capped."),
         ("Sharpness", "Edge Sharpness", "d", 0.5, 10, 3, "Higher = thinner, brighter caustic edge."),
     ),
     "ringHalo": (
+        ("Shape", "Shape", "e:Procedural|Input", 0, 0, 0,
+         "Procedural: a drawn ring. Input: use the image on the Ring input (shared with Rings), which appears on the "
+         "node while Input is chosen, as the halo shape. Only in Centre = Light (Halo): the ring around the optical "
+         "centre is always drawn. Nothing connected = procedural."),
         ("Centre", "Centre", "e:Optical Centre (Orbital / Rainbow Ring)|Light (Halo)", 0, 0, 0,
          "Optical Centre: a ring around the optical centre, lit by nearby light. "
          "Light: a halo ring around each light."),
         ("Radius", "Radius", "d", 0.02, 1.5, 0.45, "Fraction of frame height."),
-        ("Width", "Width", "d", 0.5, 300, 16, "Plate px."),
+        ("Width", "Width", "d", 0.5, 300, 40, "Solid core width of the ring in plate px."),
+        ("Softness", "Softness", "d", 0, 300, 10, "Edge falloff width in plate px (0 = crisp edge)."),
         ("Arc", "Arc", "d", 0, 1, 0.7, "Optical Centre mode: 0 = evenly lit ring, 1 = only the arc facing the light. "
          "The even part uses a fixed reference size (600 plate px), independent of Arc Falloff."),
         ("ArcFalloff", "Arc Falloff", "d", 10, 3000, 600, "How far light reaches around the ring (plate px)."),
     ),
     "orbs": (
-        ("Count", "Count", "i", 8, MAX_ORBS, 24, "Number of orbs. Max 64."),
+        ("Count", "Count", "i", 8, MAX_ORBS, 24, "Number of orbs. Max %d." % MAX_ORBS),
         ("SizeMin", "Size Min", "d", 1, 500, 10, "Radius in plate px."),
         ("SizeMax", "Size Max", "d", 1, 500, 45, "Radius in plate px."),
         ("Proximity", "Proximity", "d", 10, 3000, 400, "How close a light must be to light an orb (plate px)."),
@@ -183,15 +229,23 @@ COLOUR_EXTRA = (
      "Tint: one colour. Spectrum: physical rainbow across the colour band (violet inside, red outside). "
      "Ramp: your 4 colour stops across the band. "
      "Spectrum/Ramp cost 3x the render time of Tint for that element."),
-    ("ColorWidth", "Colour Width", "d", 0.05, 1, 0.35,
-     "Filled shapes: fraction of the radius, in from the edge, that carries the colour. "
-     "Rings: how much of the ring's width the colour band spans."),
+    ("ColorStrength", "Colour Strength", "d", 0, 1, 1,
+     "How much of the Spectrum / Ramp colour is applied: 0 = plain Tint (white), 1 = full colour. "
+     "Each channel is mixed from 1 toward the band colour."),
+    ("ColorWidth", "Colour Width", "d", 0.05, 1, 1,
+     "Filled shapes: fraction of the radius, in from the edge, that carries the colour (1 = the whole "
+     "shape, less leaves a white core). Rings: how much of the ring's width the colour band spans."),
+    ("ColorBalance", "Balance Colours", "b", 0, 0, True,
+     "On: the colours are balanced so the shape keeps its overall colour balance (neutral white core, "
+     "channel means preserved), which can look washed out. Off: the colours appear exactly as picked "
+     "(brighter and more saturated). Ring / Halo in Optical Centre mode never balances."),
     ("LightColor", "Light Colour", "d", 0, 1, 1, "1 = take the light's own colour, 0 = treat the light as white."),
     ("Noise", "Noise", "d", 0, 1, 0, "Breaks up brightness around the shape."),
     ("NoiseScale", "Noise Scale", "d", 1, 64, 8, "Number of noise features around the shape."),
     ("NoiseSpeed", "Noise Speed", "d", 0, 10, 0, "0 = static."),
 )
-RAMP_DEFAULTS = (((1.0, 0.2, 0.1), 0.0), ((1.0, 0.85, 0.2), 0.35), ((0.2, 0.9, 0.5), 0.65), ((0.3, 0.4, 1.0), 1.0))
+# Saturated rainbow, red inside to blue outside (05c; v3 stops were pale and averaged near neutral).
+RAMP_DEFAULTS = (((1.0, 0.0, 0.0), 0.0), ((1.0, 0.9, 0.0), 0.35), ((0.0, 1.0, 0.2), 0.65), ((0.1, 0.3, 1.0), 1.0))
 
 # Tuned in Nuke on a 6px light at value 5 with Source Gain 12 stops, so each
 # element peaks around 0.5-4 near the light. Hotspot-fed elements are small
@@ -210,8 +264,27 @@ def colour_knob_names(prefix):
     return names
 
 
+def streak_slot_prefix(i):
+    return "streak%d" % i
+
+
+def streak_slot_knob_names(i):
+    """Knobs of one streak slot (shown while the slot is below Count; the Offset
+    XY knob also needs its Use Offset)."""
+    pf = streak_slot_prefix(i)
+    return ([pf + "Hdr", pf + "Intensity", pf + "Tint"] + [pf + spec[0] for spec in EXTRA["streak"]]
+            + [pf + "OffsetOn", pf + "Offset"])
+
+
 def knob_names(eid):
-    """Every knob an element owns (for tests and the knob builder)."""
+    """Every knob an element owns that the graph reads (for tests and the knob
+    builder). The Streak's + / - buttons and slot headings are not read by the
+    graph and are not listed."""
+    if eid == "streak":
+        names = ["streakOn", "streakSource", "streakCount"]
+        for i in range(STREAK_SLOTS):
+            names += [n for n in streak_slot_knob_names(i) if not n.endswith("Hdr")]
+        return names
     names = [eid + "On", eid + "Intensity", eid + "Source", eid + "Tint", eid + "Offset", eid + "OffsetOn"]
     names += [eid + spec[0] for spec in EXTRA[eid]]
     if eid in COLOURED:
@@ -302,7 +375,14 @@ OFFSET_PREFIXES = ["ghosts", "star"]    # + every element id (see offset_prefixe
 
 
 def offset_prefixes():
-    return OFFSET_PREFIXES + [eid for eid, _l, _f, _s in ELEMENTS]
+    """Every prefix with Use Offset + Offset; the Streak has one per slot."""
+    out = list(OFFSET_PREFIXES)
+    for eid, _l, _f, _s in ELEMENTS:
+        if eid == "streak":
+            out += [streak_slot_prefix(i) for i in range(STREAK_SLOTS)]
+        else:
+            out.append(eid)
+    return out
 
 
 def offset_knobs(nuke, prefix):
@@ -319,23 +399,163 @@ def offset_knobs(nuke, prefix):
     return [use, off]
 
 
+def _streak_count(group, knobs):
+    if "streakCount" not in knobs:
+        return None                        # a v3 node (single streak, no slots)
+    return max(1, min(STREAK_SLOTS, int(group["streakCount"].value())))
+
+
+def _streak_slot_of(prefix):
+    if prefix.startswith("streak") and prefix[6:].isdigit():
+        return int(prefix[6:])
+    return None
+
+
 def sync_offset_visibility(group, prefix=None):
-    """Show each Offset XY knob only while its Use Offset is on. Knob
-    visibility is not saved with the script, so this also runs on load."""
-    for pf in ([prefix] if prefix else offset_prefixes()):
-        if pf + "OffsetOn" in group.knobs() and pf + "Offset" in group.knobs():
-            group[pf + "Offset"].setVisible(bool(group[pf + "OffsetOn"].value()))
+    """Show each Offset XY knob only while its Use Offset is on, and only the
+    streak slots below Streak Count. Knob visibility is not saved with the
+    script, so this also runs on load (the group's onCreate). With `prefix`
+    only that prefix's Offset knob is updated."""
+    knobs = group.knobs()
+    count = _streak_count(group, knobs)
+    if prefix is None and count is not None:
+        for i in range(STREAK_SLOTS):
+            for name in streak_slot_knob_names(i):
+                if name == streak_slot_prefix(i) + "Offset":
+                    continue                                      # Offset XY: handled below
+                if name in knobs:
+                    group[name].setVisible(i < count)
+    # "streak": the single streak of a v3 node (skipped where its knobs are absent).
+    for pf in ([prefix] if prefix else offset_prefixes() + ["streak"]):
+        if pf + "OffsetOn" in knobs and pf + "Offset" in knobs:
+            show = bool(group[pf + "OffsetOn"].value())
+            slot = _streak_slot_of(pf)
+            if slot is not None and count is not None:
+                show = show and slot < count
+            group[pf + "Offset"].setVisible(show)
+
+
+SQUEEZE_STREAK_TINT = (0.55, 0.75, 1.0)
+
+
+def _close(a, b):
+    return len(a) == len(b) and all(abs(x - y) < 1e-6 for x, y in zip(a, b))
+
+
+def squeeze_streak_defaults(group):
+    """Anamorphic Squeeze above 1x gives the first Streak (the horizontal one) the blue anamorphic streak tint, but
+    only while that slot is still untouched (angle 0 and a white tint); back at 1x it returns to white, but only if
+    the tint is still the one set here. A slot the user changed is never touched."""
+    pf = streak_slot_prefix(0)
+    if pf + "Tint" not in group.knobs() or pf + "Angle" not in group.knobs():
+        return
+    tint = list(group[pf + "Tint"].value())
+    if float(group[pf + "Angle"].value()) != 0.0:
+        return
+    if group["squeeze"].value() != SQUEEZES[0]:
+        if _close(tint, [1.0, 1.0, 1.0]):
+            group[pf + "Tint"].setValue(list(SQUEEZE_STREAK_TINT))
+    elif _close(tint, SQUEEZE_STREAK_TINT):
+        group[pf + "Tint"].setValue([1.0, 1.0, 1.0])
+
+
+def streak_step(group, delta):
+    """+ / - buttons: change Streak Count by `delta` (1..STREAK_SLOTS) and show
+    or hide the slot knobs. Touches only the Group's own knobs."""
+    n = max(1, min(STREAK_SLOTS, int(group["streakCount"].value()) + int(delta)))
+    group["streakCount"].setValue(n)
+    sync_offset_visibility(group)
+    return n
 
 
 def _centre_temps():
-    return [" temp_name0 dx", " temp_expr0 {x+0.5-width/2}",
-            " temp_name1 dy", " temp_expr1 {y+0.5-height/2}"]
+    return [" temp_name0 dx", " temp_expr0 {%s}" % KDX,
+            " temp_name1 dy", " temp_expr1 {%s}" % KDY]
 
 
-def _ray(angle_expr, length_expr, sigma_expr, falloff="1"):
-    """One half-ray from the centre: Gaussian cross-section, exp fall-off."""
-    return ("(cos(atan2(dy,dx)-(%s))>0)*exp(-pow(hypot(dx,dy)*sin(atan2(dy,dx)-(%s))/(%s),2)/2)"
-            "*exp(-pow(hypot(dx,dy)/max(0.01,%s),max(0.2,%s)))" % (angle_expr, angle_expr, sigma_expr, length_expr, falloff))
+# -- line profile (v4) -------------------------------------------------------------
+
+# (prefix, Thickness knob, Softness knob) of every line / ring shape. flareGeo
+# holds hw_<prefix> = Thickness/2 and sf_<prefix> = max(AA, Softness), both in
+# working px; rings also get bw_<prefix>, the full band width 2*hw+sf.
+PROFILE_PREFIXES = ([(streak_slot_prefix(i), "streak%dThickness" % i, "streak%dSoftness" % i)
+                     for i in range(STREAK_SLOTS)]
+                    + [(e, e + "Thickness", e + "Softness") for e in ("spikeBall", "shimmer", "sparkle", "glint", "rings")]
+                    + [("ringHalo", "ringHaloWidth", "ringHaloSoftness"), ("star", "starThickness", "starSoftness")])
+BAND_PREFIXES = ("rings", "ringHalo")
+
+
+def hw_ref(prefix):
+    return "%s.hw_%s" % (GEO, prefix)
+
+
+def sf_ref(prefix):
+    return "%s.sf_%s" % (GEO, prefix)
+
+
+def bw_ref(prefix):
+    return "%s.bw_%s" % (GEO, prefix)
+
+
+def geo_ref(prefix, name):
+    return "%s.%s_%s" % (GEO, name, prefix)
+
+
+def profile(d_expr, prefix):
+    """Exact pixel coverage of the line profile at signed distance `d_expr`
+    (working px, perpendicular to the line / radial for rings) from the
+    centre-line: the integral of p(d) = clamp((hw-|d|)/sf+0.5,0,1) over the
+    1 px box [d-0.5,d+0.5] (a pixel of the kernel canvas).
+
+    With r(u) = clamp(u/sf+0.5,0,1) and its antiderivative A(u) = u for
+    u >= sf/2, (u+sf/2)^2/(2 sf) for |u| < sf/2, 0 below, the integral of p up
+    to d is W(d) = A(hw+d) (d <= 0) or Winf - A(hw-d) (d > 0), and
+    coverage = W(d+0.5) - W(d-0.5). With a = |d| and Aq(v) = A(hw-v)
+    = clamp(hp-v,0,sf)^2*kq + max(0,hm-v) (hp = hw+sf/2, hm = hw-sf/2,
+    kq = 1/(2 sf), Winf = wi):
+        a >= 0.5: Aq(a-0.5) - Aq(a+0.5)
+        a <  0.5: wi - Aq(0.5-a) - Aq(a+0.5)
+    Sums to Winf (= 2 hw once hw >= sf/2) across the line, so thin lines keep
+    their energy and Convolve2 normalizes the rest."""
+    hp, hm, sf, kq, wi = (geo_ref(prefix, n) for n in ("hp", "hm", "sf", "kq", "wi"))
+    a = "abs(%s)" % d_expr
+
+    def aq(v):
+        return "(pow(clamp(%s-%s,0,%s),2)*%s+max(0,%s-%s))" % (hp, v, sf, kq, hm, v)
+
+    return "((%s>=0.5?%s:%s-%s)-%s)" % (a, aq("(%s-0.5)" % a), wi, aq("(0.5-%s)" % a), aq("(%s+0.5)" % a))
+
+
+def profile_geo_knobs():
+    """(name, expr) of the flareGeo profile knobs (PROFILE_PREFIXES): hw
+    (Thickness/2), sf (max(AA, Softness)), hp = hw+sf/2, hm = hw-sf/2,
+    kq = 1/(2 sf), wi = Winf = 2*(min(hp,sf)^2*kq + max(0,hm)); rings also bw,
+    the full band width 2*hw+sf."""
+    out = []
+    for prefix, thick, soft in PROFILE_PREFIXES:
+        out.append(("hw_" + prefix, "parent.%s*%s/2" % (thick, RES)))
+        out.append(("sf_" + prefix, "max(%g,parent.%s*%s)" % (AA, soft, RES)))
+        out.append(("hp_" + prefix, "%s+%s/2" % (hw_ref(prefix), sf_ref(prefix))))
+        out.append(("hm_" + prefix, "%s-%s/2" % (hw_ref(prefix), sf_ref(prefix))))
+        out.append(("kq_" + prefix, "1/(2*%s)" % sf_ref(prefix)))
+        out.append(("wi_" + prefix, "2*(pow(min(%s,%s),2)*%s+max(0,%s))"
+                    % (geo_ref(prefix, "hp"), sf_ref(prefix), geo_ref(prefix, "kq"), geo_ref(prefix, "hm"))))
+        if prefix in BAND_PREFIXES:
+            out.append(("bw_" + prefix, "2*%s+%s" % (hw_ref(prefix), sf_ref(prefix))))
+    return out
+
+
+def _polar_temps():
+    """Temps 0-1: rr, an (polar coordinates about the canvas centre)."""
+    return [" temp_name0 rr", " temp_expr0 {hypot(%s,%s)}" % (KDX, KDY),
+            " temp_name1 an", " temp_expr1 {atan2(%s,%s)}" % (KDY, KDX)]
+
+
+def _ray(prefix, angle_expr, length_expr, falloff="1"):
+    """One half-ray from the centre (temps rr, an): line coverage across,
+    exp fall-off along."""
+    return ("(cos(an-(%s))>0)*%s*exp(-pow(rr/max(0.01,%s),max(0.2,%s)))"
+            % (angle_expr, profile("rr*sin(an-(%s))" % angle_expr, prefix), length_expr, falloff))
 
 
 def _finish(eid, out_lines, kernel, conv_src="%s_src", gain_extra="1"):
@@ -367,10 +587,16 @@ def _ramp(prefix, u, chan):
     return "((%s)<%s?%s:((%s)<%s?%s:%s))" % (u, q[1], seg(0), u, q[2], seg(1), seg(2))
 
 
+def colour_strength(prefix):
+    return "clamp(%s,0,1)" % p(prefix, "ColorStrength")
+
+
 def _band_colour(prefix, u, chan):
-    """Spectrum (mode 1) or Ramp (mode 2) colour at band coordinate u, >= 0."""
+    """Spectrum (mode 1) or Ramp (mode 2) colour at band coordinate u, >= 0,
+    mixed from white by Colour Strength (the same mix as colour_expr, so the
+    balance quadrature matches the kernel at every strength)."""
     mode = p(prefix, "ColorMode")
-    return "max(0,(%s==1?%s:%s))" % (mode, _spectrum(u, chan), _ramp(prefix, u, chan))
+    return "max(0,1+%s*((%s==1?%s:%s)-1))" % (colour_strength(prefix), mode, _spectrum(u, chan), _ramp(prefix, u, chan))
 
 
 # Which kernel shape each coloured prefix's balance integrates over.
@@ -420,9 +646,24 @@ def _filled_weights(prefix):
     return names
 
 
+def ring_sample_offsets():
+    """x_k across the ring band, in units of the full band width (-0.5..0.5)."""
+    return [-0.5 + (k + 0.5) / RING_SAMPLES for k in range(RING_SAMPLES)]
+
+
+def _ring_weights(prefix):
+    """(name, expr) of the flareGeo weight knobs for a ring: the line profile
+    at the RING_SAMPLES band samples and their sum. In band units the profile
+    is clamp((0.5-|x|)*bw/sf,0,1) (bw = 2*hw+sf, see profile())."""
+    names = [("w_%s_%d" % (prefix, k), "clamp(%g*%s/%s,0,1)" % (0.5 - abs(x), bw_ref(prefix), sf_ref(prefix)))
+             for k, x in enumerate(ring_sample_offsets())]
+    names.append(("w_%s_sum" % prefix, "+".join("%s.%s" % (GEO, n) for n, _e in names)))
+    return names
+
+
 def balance_weight_knobs(prefix, shape):
     """flareGeo helper knobs colour_balance(prefix, shape) reads."""
-    return _filled_weights(prefix) if shape == "filled" else []
+    return _filled_weights(prefix) if shape == "filled" else _ring_weights(prefix)
 
 
 def colour_balance(prefix, shape):
@@ -437,9 +678,9 @@ def colour_balance(prefix, shape):
       aperture polygon covers only part of the outer band (without this a
       6-blade Iris centre is 15-30% off neutral), the caustic is edge-weighted.
       The weights are flareGeo knobs (w_<prefix>_*), shared by r, g and b.
-    ring: Gaussian ring profile, 16 samples d_k = -4+8*(k+0.5)/16 sigma,
-      weight exp(-d_k^2/2) (normalised here), u = clamp(d_k/(4*cw)+0.5,0,1)
-      as in ring_band.
+    ring: line profile across the band, 16 samples x_k = -0.5+(k+0.5)/16 of
+      the full band width, weight = the profile there (flareGeo knobs
+      w_<prefix>_k, _ring_weights), u = clamp(x_k/cw+0.5,0,1) as in ring_band.
     Tint (mode 0) -> 1. Never floored: a channel the colour lacks gets 0."""
     mode = p(prefix, "ColorMode")
     cw = "clamp(%s,0.05,1)" % p(prefix, "ColorWidth")
@@ -452,14 +693,11 @@ def colour_balance(prefix, shape):
                 terms.append("%s.w_%s_%d*%s" % (GEO, prefix, k, _band_colour(prefix, "%g" % uk, ch)))
             body = "(%s)/%s.w_%s_sum" % ("+".join(terms), GEO, prefix)
         elif shape == "ring":
-            ds = [-4.0 + 8.0 * (k + 0.5) / RING_SAMPLES for k in range(RING_SAMPLES)]
-            ws = [math.exp(-d * d / 2.0) for d in ds]
-            tot = sum(ws)
             terms = []
-            for d, w in zip(ds, ws):
-                uk = "clamp(%g/(4*%s)+0.5,0,1)" % (d, cw)
-                terms.append("%.6g*%s" % (w / tot, _band_colour(prefix, uk, ch)))
-            body = "+".join(terms)
+            for k, xk in enumerate(ring_sample_offsets()):
+                uk = "clamp(%g/%s+0.5,0,1)" % (xk, cw)
+                terms.append("%s.w_%s_%d*%s" % (GEO, prefix, k, _band_colour(prefix, uk, ch)))
+            body = "(%s)/%s.w_%s_sum" % ("+".join(terms), GEO, prefix)
         else:
             raise ValueError(shape)
         out.append("(%s==0?1:(%s))" % (mode, body))
@@ -467,15 +705,16 @@ def colour_balance(prefix, shape):
 
 
 def balance_refs(prefix):
-    """flareGeo knobs holding colour_balance(prefix, ...) for r, g, b."""
-    return tuple("%s.bal_%s_%s" % (GEO, prefix, ch) for ch in "rgb")
+    """The balance gain for r, g, b: the flareGeo knobs holding
+    colour_balance(prefix, ...), or 1 while Balance Colours is off."""
+    return tuple("(%s?%s.bal_%s_%s:1)" % (p(prefix, "ColorBalance"), GEO, prefix, ch) for ch in "rgb")
 
 
 def colour_expr(prefix, u, inside_band, chan):
     """Colour of the shape at band coordinate `u` for one channel (>= 0)."""
     mode = p(prefix, "ColorMode")
-    return "max(0,((%s)?(%s==1?%s:(%s==2?%s:1)):1))" % (
-        inside_band, mode, _spectrum(u, chan), mode, _ramp(prefix, u, chan))
+    return "max(0,1+%s*(((%s)?(%s==1?%s:(%s==2?%s:1)):1)-1))" % (
+        colour_strength(prefix), inside_band, mode, _spectrum(u, chan), mode, _ramp(prefix, u, chan))
 
 
 def time_ref(prefix):
@@ -494,9 +733,25 @@ def noise_expr(prefix, angle, slot=0):
             % (amt, amt, angle, sc, angle, sc, z))
 
 
+FLICKER_PHASES = (("r", 3.7), ("g", 7.9), ("b", 12.1))
+
+
+def flicker_geo_knobs():
+    """Master flicker gain per channel: fl_<c> = max(0, 1 + Amount*n0(t) +
+    Colour Jitter*n_c(t)), n = noise at t = flareGeo.t_flicker (frame*Speed)
+    and Seed; the jitter noise of each channel has its own phase. Amount and
+    Jitter 0 give exactly 1 on every frame (no time dependence downstream)."""
+    t = "%s.t_flicker*0.25+0.31" % GEO
+    seed = "parent.flickerSeed*1.731"
+    base = "parent.flickerAmount*noise(%s,%s+0.5)" % (t, seed)
+    return [("fl_%s" % ch, "max(0,1+%s+parent.flickerJitter*noise(%s,%s+%g))" % (base, t, seed, ph))
+            for ch, ph in FLICKER_PHASES]
+
+
 def geo_tcl():
     """The flareGeo NoOp: pad, frame size and optical centre (working px), the
-    animation times and every coloured prefix's colour balance, evaluated once
+    animation times, every coloured prefix's colour balance, the line profile
+    widths, the Shimmer ray table and the Master flicker gains, evaluated once
     per frame. Other nodes read them as flareGeo.<knob> (expression syntax; no
     Python node access). The only place `frame` appears in the graph."""
     knobs = [("padx", PADX_EXPR), ("pady", PADY_EXPR), ("fw", "flareDown.width"), ("fh", "flareDown.height"),
@@ -505,6 +760,11 @@ def geo_tcl():
         knobs.append(("t_" + prefix, "frame*%s" % p(prefix, "NoiseSpeed")))
     knobs.append(("t_shimmer", "frame*%s" % p("shimmer", "Speed")))
     knobs.append(("t_sparkle", "frame*%s" % p("sparkle", "Speed")))
+    knobs.append(("t_flicker", "frame*parent.flickerSpeed"))
+    knobs.append(("sq", squeeze_expr()))
+    knobs += flicker_geo_knobs()
+    knobs += profile_geo_knobs()
+    knobs += shimmer_geo_knobs()
     for prefix, shape in BALANCE_SHAPES:
         knobs += balance_weight_knobs(prefix, shape)
         for ch, expr in zip("rgb", colour_balance(prefix, shape)):
@@ -547,76 +807,122 @@ def coloured_conv_tcl(prefix, kernel_var, src_var, off_expr, tag):
 # -- centred elements ---------------------------------------------------------------
 
 def _streak_tcl():
+    """STREAK_SLOTS streaks sharing Enable and Source. Slot i is live while
+    i < Streak Count: past it the kernel and Convolve2 are disabled and the
+    gain is multiplied by 0. Each slot has its own Offset."""
     e = "streak"
-    th = "%s*pi/180" % p(e, "Angle")
-    body = _centre_temps() + [
-        " temp_name2 sw", " temp_expr2 {hypot(%s*%s/2.355,%g)}" % (p(e, "Thickness"), RES, AA),
-        " temp_name3 sl", " temp_expr3 {max(0.5,%s*%s)}" % (p(e, "Length"), RES),
-        " expr0 0", " expr1 0", " expr2 0",
-        " expr3 {exp(-pow(abs(dx*cos(%s)+dy*sin(%s))/sl,max(0.2,%s)))*exp(-pow((-dx*sin(%s)+dy*cos(%s))/sw,2)/2)}"
-        % (th, th, p(e, "Falloff"), th, th),
-    ]
-    return _finish(e, [_source(e)], _kernel(e, "streakKernel", body))
+    out = [_source(e)]
+    for i in range(STREAK_SLOTS):
+        pf = streak_slot_prefix(i)
+        off = "{{!parent.%sOn||parent.%sCount<=%d}}" % (e, e, i)
+        th = "%s*pi/180" % p(pf, "Angle")
+        body = [" temp_name0 al", " temp_expr0 {%s*cos(%s)+%s*sin(%s)}" % (KDX, th, KDY, th),
+                " temp_name1 ac", " temp_expr1 {%s*cos(%s)-%s*sin(%s)}" % (KDY, th, KDX, th),
+                " temp_name2 sl", " temp_expr2 {max(0.5,%s*%s)}" % (p(pf, "Length"), RES),
+                " expr0 0", " expr1 0", " expr2 0",
+                " expr3 {exp(-pow(abs(al)/sl,max(0.2,%s)))*%s}"
+                % (p(pf, "Falloff"), profile("ac", pf))]
+        out.append(_kernel(e, "%sKernel" % pf, body, off))
+        out.append("set %sK [stack 0]" % pf)
+        out.append(_convolve("%sK" % pf, "%s_src" % e, off, "%sConv" % pf))
+        k = "parent.%sOn*(parent.%sCount>%d)*parent.%sIntensity" % (e, e, i, pf)
+        out.append("Expression {\n temp_name0 kk\n temp_expr0 {%s}\n"
+                   " expr0 {r*kk*parent.%sTint.r}\n expr1 {g*kk*parent.%sTint.g}\n expr2 {b*kk*parent.%sTint.b}\n"
+                   " expr3 0\n name %sGain\n}" % (k, pf, pf, pf, pf))
+        out.append(offset_tcl(pf, "%sOffsetT" % pf))
+        out.append("set sk%d [stack 0]" % i)
+    acc = "$sk0"
+    for i in range(1, STREAK_SLOTS):
+        out.append("push $sk%d\npush %s\nMerge2 { inputs 2 operation plus also_merge all }\nset sk_acc [stack 0]" % (i, acc))
+        acc = "$sk_acc"
+    out.append("push %s\nset el_%s [stack 0]" % (acc, e))
+    return "\n".join(out)
 
 
 def _spike_ball_tcl():
     e = "spikeBall"
     seed = p(e, "Seed")
+    sl = "%s*%s" % (p(e, "Length"), RES)
     terms = []
     for k in range(MAX_SPIKE_RAYS):
         ang = "2*pi*%s" % _hash(k, 12.9898, 78.233, seed)
-        length = "sl*(1-%s*%s)" % (p(e, "Variation"), _hash(k, 39.3467, 11.135, seed))
-        terms.append("(%d<%s)*%s" % (k, p(e, "Rays"), _ray(ang, length, "sw")))
-    body = _centre_temps() + [
-        " temp_name2 sw", " temp_expr2 {hypot(%s*%s/2.355,%g)}" % (p(e, "Thickness"), RES, AA),
-        " temp_name3 sl", " temp_expr3 {max(0.01,%s*%s)}" % (p(e, "Length"), RES),
+        length = "%s*(1-%s*%s)" % (sl, p(e, "Variation"), _hash(k, 39.3467, 11.135, seed))
+        terms.append("(%d<%s)*%s" % (k, p(e, "Rays"), _ray(e, ang, length)))
+    body = _polar_temps() + [
         " expr0 0", " expr1 0", " expr2 0",
-        " expr3 {hypot(dx,dy)<0.5?0:%s}" % "+".join(terms),
+        " expr3 {rr<0.5?0:%s}" % "+".join(terms),
     ]
     return _finish(e, [_source(e)], _kernel(e, "spikeBallKernel", body))
 
 
-def _shimmer_tcl():
+def shimmer_geo_knobs():
+    """flareGeo knobs of the Shimmer rays: direction (sh_c<k>, sh_s<k> = cos,
+    sin of a random angle from Seed) and brightness sh_b<k> = 0.5+0.5*noise
+    over flareGeo.t_shimmer, 0 for rays past Rays. Once per frame, so the
+    kernel does no trig per ray."""
     e = "shimmer"
-    f = "%s/(2*pi)" % p(e, "Rays")
+    seed = p(e, "Seed")
+    out = []
+    for k in range(MAX_SHIMMER_RAYS):
+        ang = "2*pi*%s" % _hash(k, 12.9898, 78.233, seed)
+        out.append(("sh_c%d" % k, "cos(%s)" % ang))
+        out.append(("sh_s%d" % k, "sin(%s)" % ang))
+        out.append(("sh_b%d" % k, "(%d<%s)*clamp(0.5+0.5*noise(%g,%s*1.37+0.31,%s*0.2),0,1)"
+                    % (k, p(e, "Rays"), k * 1.618 + 0.5, seed, time_ref(e))))
+    return out
+
+
+def _shimmer_tcl():
+    """Rays thin half-rays at random angles with the line profile and an exp
+    fall-off (Length); each ray's brightness flickers (sh_b<k> on flareGeo)."""
+    e = "shimmer"
+    terms = []
+    for k in range(MAX_SHIMMER_RAYS):
+        c, sn, b = ("%s.sh_%s%d" % (GEO, t, k) for t in "csb")
+        terms.append("%s*((dx*%s+dy*%s)>0)*%s" % (b, c, sn, profile("dy*%s-dx*%s" % (c, sn), e)))
     body = _centre_temps() + [
-        " temp_name2 rr", " temp_expr2 {hypot(dx,dy)}",
-        " temp_name3 nz",
-        " temp_expr3 {noise(cos(atan2(dy,dx))*%s+%s*1.37,sin(atan2(dy,dx))*%s,%s*0.15)}"
-        % (f, p(e, "Seed"), f, time_ref(e)),
         " expr0 0", " expr1 0", " expr2 0",
-        " expr3 {rr<0.5?0:pow(clamp(0.5+1.5*nz,0,1),6)*exp(-rr/max(0.01,%s*%s))}" % (p(e, "Length"), RES),
+        " expr3 {hypot(dx,dy)<0.5?0:exp(-hypot(dx,dy)/max(0.01,%s*%s))*(%s)}"
+        % (p(e, "Length"), RES, "+".join(terms)),
     ]
     return _finish(e, [_source(e)], _kernel(e, "shimmerKernel", body))
 
 
+def sparkle_points_expr():
+    pts = p("sparkle", "Points")
+    out = "%d" % SPARKLE_POINTS[-1]
+    for i in range(len(SPARKLE_POINTS) - 2, -1, -1):
+        out = "(%s==%d?%d:%s)" % (pts, i, SPARKLE_POINTS[i], out)
+    return out
+
+
 def _sparkle_tcl():
     e = "sparkle"
-    npts = "(4+2*%s)" % p(e, "Points")           # enum 0/1/2 -> 4/6/8
+    npts = sparkle_points_expr()
+    sz = "max(0.01,%s*%s)" % (p(e, "Size"), RES)
     terms = []
     for k in range(MAX_SPARKLE_POINTS):
         ang = "%s*pi/180+%d*2*pi/%s" % (p(e, "Rotation"), k, npts)
         tw = "(0.6+0.4*sin(%s+%d*2.399))" % (time_ref(e), k)
-        terms.append("(%d<%s)*%s*%s" % (k, npts, tw, _ray(ang, "sz", "%g" % 0.6)))
-    body = _centre_temps() + [
-        " temp_name2 sz", " temp_expr2 {max(0.01,%s*%s)}" % (p(e, "Size"), RES),
+        terms.append("(%d<%s)*%s*%s" % (k, npts, tw, _ray(e, ang, sz)))
+    body = _polar_temps() + [
         " expr0 0", " expr1 0", " expr2 0",
-        " expr3 {(hypot(dx,dy)<0.5?0:%s)+4*exp(-pow(hypot(dx,dy)/max(0.5,sz*0.06),2)/2)}" % "+".join(terms),
+        " expr3 {(rr<0.5?0:%s)+4*exp(-pow(rr/max(0.5,%s*0.06),2)/2)}" % ("+".join(terms), sz),
     ]
     return _finish(e, [_source(e)], _kernel(e, "sparkleKernel", body))
 
 
 def _glint_tcl():
     e = "glint"
+    gl = "%s*%s" % (p(e, "SpikeLength"), RES)
     rays = []
     for k in range(4):
         ang = "%s*pi/180+%d*pi/2" % (p(e, "Angle"), k)
-        rays.append(_ray(ang, "gl", "%g" % 0.5))
-    body = _centre_temps() + [
-        " temp_name2 gs", " temp_expr2 {hypot(%s*%s/2.355,%g)}" % (p(e, "Size"), RES, AA),
-        " temp_name3 gl", " temp_expr3 {max(0.01,%s*%s)}" % (p(e, "SpikeLength"), RES),
+        rays.append(_ray(e, ang, gl))
+    gs = "hypot(%s*%s/2.355,%g)" % (p(e, "Size"), RES, AA)
+    body = _polar_temps() + [
         " expr0 0", " expr1 0", " expr2 0",
-        " expr3 {8*exp(-pow(hypot(dx,dy)/gs,2)/2)+(hypot(dx,dy)<0.5?0:%s)}" % "+".join(rays),
+        " expr3 {8*exp(-pow(rr/%s,2)/2)+(rr<0.5?0:%s)}" % (gs, "+".join(rays)),
     ]
     return _finish(e, [_source(e)], _kernel(e, "glintKernel", body))
 
@@ -656,14 +962,102 @@ def _axial_copy(eid, pos_expr, disable, name):
 
 
 SHAPE_TEMPS_R = " temp_expr3 {max(0.5,min(%s,min(width,height)/2-4))}"
+SQUEEZES = ["1x", "1.33x", "1.5x", "1.8x", "2x"]
+SQUEEZE_VALUES = (1.0, 1.33, 1.5, 1.8, 2.0)
+SQ = GEO + ".sq"                                  # anamorphic squeeze factor (flareGeo)
 
 
-def shape_temps(radius_expr):
-    """Centred kernel temps: dist, sec, aw (aperture angle), R (clamped to the canvas)."""
-    return [" temp_name0 dist", " temp_expr0 {hypot(x+0.5-width/2,y+0.5-height/2)}",
+def squeeze_expr():
+    """Squeeze menu index -> factor, as an expression."""
+    out = "%g" % SQUEEZE_VALUES[-1]
+    for i in range(len(SQUEEZE_VALUES) - 2, -1, -1):
+        out = "(parent.squeeze==%d?%g:%s)" % (i, SQUEEZE_VALUES[i], out)
+    return out
+
+
+def shape_temps(radius_expr, squeeze=True, clamp=True):
+    """Centred kernel temps: dist, sec, aw (aperture angle), R (clamped to the canvas unless `clamp` is off: an
+    image kernel is already sized from the clamped radius). With `squeeze` the kernel x axis is scaled by the
+    anamorphic Squeeze, so the shape comes out 1/Squeeze as wide (an oval, taller than wide); rings stay round."""
+    kx = "%s*%s" % (KDX, SQ) if squeeze else KDX
+    return [" temp_name0 dist", " temp_expr0 {hypot(%s,%s)}" % (kx, KDY),
             " temp_name1 sec", " temp_expr1 {2*pi/clamp(parent.blades,3,12)}",
-            " temp_name2 aw", " temp_expr2 {atan2(y+0.5-height/2,x+0.5-width/2)-parent.apRotation*pi/180}",
-            " temp_name3 R", SHAPE_TEMPS_R % radius_expr]
+            " temp_name2 aw", " temp_expr2 {atan2(%s,%s)-parent.apRotation*pi/180}" % (KDY, kx),
+            " temp_name3 R", SHAPE_TEMPS_R % radius_expr if clamp else " temp_expr3 {%s}" % radius_expr]
+
+
+# -- kernels from a connected image (Caustic / Ring / Aperture inputs) ------------------------------
+
+def kernel_radius(radius_expr):
+    """Kernel radius clamped to the padded canvas, exactly as shape_temps' R."""
+    return "max(0.5,min(%s,min(overscanPad.width,overscanPad.height)/2-4))" % radius_expr
+
+
+def custom_kernel_tcl(prefix, tag, src_var, radius, off_inner, active_inner, squeeze, slot=0):
+    """Kernel from the image on an optional input, leaving it on the stack. The image is fitted (aspect kept) into a
+    square box of odd side 2*floor(R)+1, squeezed horizontally to an odd width 2*floor(R/Squeeze)+1 when `squeeze`, and
+    used as the kernel image itself: its centre pixel is exactly Convolve2's origin (pixel floor(w/2), floor(h/2)),
+    so the kernel is centred to the pixel like the drawn ones (BF-12b). Read as alpha = luminance (the shape), rgb =
+    the image colour times the colour system (Tint ignores the colour, Spectrum / Ramp tint it across the radius),
+    with the same normalisation floor as every kernel. Disabled unless the element is on and the input is chosen and
+    connected (`active_inner`)."""
+    off = "{{%s||!(%s)}}" % (off_inner, active_inner)
+    rr = kernel_radius(radius)
+    side = "(2*floor(%s)+1)" % rr
+    out = ["push $%s\nReformat {\n type \"to box\"\n box_width {{%s}}\n box_height {{%s}}\n box_fixed true\n"
+           " resize fit\n disable %s\n name %sCFit\n}" % (src_var, side, side, off, tag)]
+    if squeeze:
+        out.append("Reformat {\n type \"to box\"\n box_width {{2*floor(%s/%s)+1}}\n box_height {{%s}}\n"
+                   " box_fixed true\n resize distort\n disable %s\n name %sCSq\n}" % (rr, SQ, side, off, tag))
+    u, band = filled_band(prefix)
+    nz = noise_expr(prefix, "aw", slot)
+    lines = list(shape_temps(rr, squeeze, False))
+    for i, ch in enumerate("rgb"):
+        lines.append(" expr%d {max(0,%s)*%s*%s}" % (i, ch, nz, colour_expr(prefix, u, band, ch)))
+    lines.append(" expr3 {max(0,0.2126*r+0.7152*g+0.0722*b)*%s}" % nz)
+    out.append("Expression {\n%s\n disable %s\n name %sCKernel\n}" % ("\n".join(with_floor(lines)), off, tag))
+    return "\n".join(out)
+
+
+CUSTOM_INPUTS = ("in_caustic", "in_ring", "in_aperture")
+
+
+def mean_colour_tcl():
+    """For every custom-shape input a uniform padded-canvas image of its average colour ($<input>_mean): the input
+    shrunk to one pixel (Parzen filter: a non-negative weighted average) and stretched back. Convolve2 normalizes
+    each colour channel's kernel to sum 1, so an image kernel's colour has to be restored by the ratio of its mean
+    channel to its mean luminance (custom_balance_tcl), the same job colour_balance does for drawn shapes."""
+    out = []
+    for var in CUSTOM_INPUTS:
+        name = "".join(w.capitalize() for w in var.split("_")[1:])
+        out.append("push $%s\nReformat {\n type \"to box\"\n box_width 1\n box_height 1\n box_fixed true\n resize distort\n"
+                   " filter Parzen\n name %sMean1\n}\nReformat {\n type \"to box\"\n box_width {{overscanPad.width}}\n"
+                   " box_height {{overscanPad.height}}\n box_fixed true\n resize distort\n filter impulse\n name %sMean\n}\n"
+                   "set %s_mean [stack 0]" % (var, name, name, var))
+    return "\n".join(out)
+
+
+def custom_balance_tcl(prefix, tag, src_var, active_inner):
+    """After an element's gain: restore the colour an image kernel carries (channel mean / luminance mean of the
+    image, from mean_colour_tcl). Only while the image kernel is active and a colour mode with Balance Colours is
+    on; otherwise the node is disabled and passes the gain through (B = the stream, input 0)."""
+    on = "(%s)&&parent.%sColorMode>0&&parent.%sColorBalance" % (active_inner, prefix, prefix)
+    rows = "\n".join(" expr%d {B.%s*A.%s/lm}" % (i, ch, ch) for i, ch in enumerate("rgb"))
+    return ("set %sBS [stack 0]\npush $%s_mean\npush $%sBS\nMergeExpression {\n inputs 2\n temp_name0 lm\n"
+            " temp_expr0 {max(0.000001,0.2126*A.r+0.7152*A.g+0.0722*A.b)}\n%s\n expr3 {B.a}\n disable {{!(%s)}}\n name %sCBal\n}"
+            % (tag, src_var, tag, rows, on, tag))
+
+
+def pick_kernel_tcl(tag, proc_tcl, custom_tcl, active_inner):
+    """Procedural kernel (`proc_tcl`) or the image kernel (`custom_tcl`), picked by `active_inner`. Leaves the
+    pick on the stack."""
+    return "\n".join([proc_tcl, "set %sKP [stack 0]" % tag, custom_tcl, "set %sKC [stack 0]" % tag,
+                      "push $%sKC\npush $%sKP\nSwitch {\n inputs 2\n which {{%s}}\n name %sKSel\n}" % (tag, tag, active_inner, tag)])
+
+
+def custom_active(shape_knob, input_name, extra="1"):
+    """Expression: the element's Shape is Input, the input has an image, and `extra` holds."""
+    return "parent.%s==1&&%s.bbox.w>1&&(%s)" % (shape_knob, input_name + "Src", extra)
 
 
 APERTURE_EDGE = "lerp(R*cos(sec/2)/cos(aw-sec*floor(aw/sec)-sec/2),R,parent.apRoundness)"
@@ -680,17 +1074,27 @@ def filled_band(prefix):
     return ("clamp((dist-R*(1-%s))/(R*%s),0,1)" % (cw, cw), "dist>R*(1-%s)" % cw)
 
 
-def _coloured_axial(e, tag, pos, off, kernel_body_shape, radius, gain_on, chan_tint=("1", "1", "1"), slot=0):
-    """One coloured axial copy: transform -> RGBA kernel -> picked convolve -> gain."""
+def _coloured_axial(e, tag, pos, off, kernel_body_shape, radius, gain_on, chan_tint=("1", "1", "1"), slot=0,
+                    custom=None):
+    """One coloured axial copy: transform -> RGBA kernel -> picked convolve -> gain. `custom` = (input var,
+    active expression) adds the image kernel from an optional input, picked while active."""
     u, band = filled_band(e)
     out = [_axial_copy(e, pos, off, "%sCopy" % tag), "set %sT [stack 0]" % tag]
     lines = coloured_kernel_lines(e, shape_temps(radius), kernel_body_shape, u, band, "aw", slot)
-    out.append("push $hl\nExpression {\n%s\n disable %s\n name %sKernel\n}" % ("\n".join(with_floor(lines)), off, tag))
+    kernel = "push $hl\nExpression {\n%s\n disable %s\n name %sKernel\n}" % ("\n".join(with_floor(lines)), off, tag)
+    if custom:
+        kernel = pick_kernel_tcl(tag, kernel, custom_kernel_tcl(e, tag, custom[0], radius, off.strip("{}"), custom[1], True, slot),
+                                 custom[1])
+    out.append(kernel)
     out.append("set %sK [stack 0]" % tag)
     out.append(coloured_conv_tcl(e, "%sK" % tag, "%sT" % tag, off.strip("{}"), tag))
     bal = balance_refs(e)
+    if custom:                                         # an image kernel carries its own colour balance
+        bal = tuple("((%s)?1:%s)" % (custom[1], b) for b in bal)
     chan = tuple("%s*%s" % (b, t) for b, t in zip(bal, chan_tint))
     out.append(_gain(e, "%sGain" % tag, "%s/pow(%s,2)" % (gain_on, pos), chan))
+    if custom:
+        out.append(custom_balance_tcl(e, tag, custom[0], custom[1]))
     return "\n".join(out)
 
 
@@ -698,7 +1102,8 @@ def _iris_tcl():
     e = "iris"
     pos = _safe_pos(p(e, "Position"))
     radius = "%s*%s*2.8/parent.effFstop" % (p(e, "Size"), RES)
-    body = _coloured_axial(e, "iris", pos, _on(e), iris_shape("%s*%s" % (p(e, "Softness"), RES)), radius, "1")
+    body = _coloured_axial(e, "iris", pos, _on(e), iris_shape("%s*%s" % (p(e, "Softness"), RES)), radius, "1",
+                           custom=("in_aperture", custom_active("apShape", "Aperture")))
     return "\n".join([_source(e, True), body, offset_tcl(e, "irisOffsetT"), "set el_%s [stack 0]" % e])
 
 
@@ -715,7 +1120,8 @@ def _multi_iris_tcl():
         tint = tuple("(1+%s*(%s-0.5))" % (cv, _hash(i, c, hb, seed))
                      for c, hb in ((11.1, 1.618), (22.2, 2.414), (33.3, 3.732)))
         out.append(_coloured_axial(e, "multiIris%d" % i, pos, off, iris_shape("1"), size,
-                                   "(parent.%sCount>%d)" % (e, i), tint, slot=i))
+                                   "(parent.%sCount>%d)" % (e, i), tint, slot=i,
+                                   custom=("in_aperture", custom_active("apShape", "Aperture"))))
         out.append("set mi%d [stack 0]" % i)
     acc = "$mi0"
     for i in range(1, MULTI_IRIS_SLOTS):
@@ -725,16 +1131,16 @@ def _multi_iris_tcl():
     return "\n".join(out)
 
 
-def ring_band(prefix, offset_expr, sigma_expr):
-    """u across a ring: 0 inside .. 1 outside over 4 sigma x Colour Width."""
+def ring_band(prefix, offset_expr):
+    """u across a ring: 0 inside .. 1 outside over the ring's full band width
+    (Thickness + Softness, flareGeo.bw_<prefix>) x Colour Width."""
     cw = "clamp(%s,0.05,1)" % p(prefix, "ColorWidth")
-    return "clamp((%s)/(4*%s*%s)+0.5,0,1)" % (offset_expr, sigma_expr, cw)
+    return "clamp((%s)/(%s*%s)+0.5,0,1)" % (offset_expr, bw_ref(prefix), cw)
 
 
-def ring_profile(prefix, sigma_expr):
-    """(shape, u, inside_band) for a Gaussian ring of radius R."""
-    s = "hypot(%s,%g)" % (sigma_expr, AA)
-    return ("exp(-pow((dist-R)/%s,2)/2)" % s, ring_band(prefix, "dist-R", s), "1")
+def ring_profile(prefix):
+    """(shape, u, inside_band) for a ring of radius R with the line profile."""
+    return (profile("dist-R", prefix), ring_band(prefix, "dist-R"), "1")
 
 
 def _rings_tcl():
@@ -746,13 +1152,18 @@ def _rings_tcl():
         tag = "rings%d" % i
         out.append(_axial_copy(e, pos, off, "%sCopy" % tag))
         out.append("set %sT [stack 0]" % tag)
-        shape, u, band = ring_profile(e, "%s*%s/2.355" % (p(e, "Thickness"), RES))
+        shape, u, band = ring_profile(e)
         radius = "%s*%s*(1+%d*0.18)" % (p(e, "Radius"), RES, i)
-        lines = coloured_kernel_lines(e, shape_temps(radius), shape, u, band, "aw", i)
-        out.append("push $hl\nExpression {\n%s\n disable %s\n name %sKernel\n}" % ("\n".join(with_floor(lines)), off, tag))
+        lines = coloured_kernel_lines(e, shape_temps(radius, False), shape, u, band, "aw", i)
+        kernel = "push $hl\nExpression {\n%s\n disable %s\n name %sKernel\n}" % ("\n".join(with_floor(lines)), off, tag)
+        active = custom_active("ringsShape", "Ring")
+        out.append(pick_kernel_tcl(tag, kernel, custom_kernel_tcl(e, tag, "in_ring", radius, off.strip("{}"), active, False, i),
+                                   active))
         out.append("set %sK [stack 0]" % tag)
         out.append(coloured_conv_tcl(e, "%sK" % tag, "%sT" % tag, off.strip("{}"), tag))
-        out.append(_gain(e, "%sGain" % tag, "(parent.%sCount>%d)/pow(%s,2)" % (e, i, pos), balance_refs(e)))
+        out.append(_gain(e, "%sGain" % tag, "(parent.%sCount>%d)/pow(%s,2)" % (e, i, pos),
+                         tuple("((%s)?1:%s)" % (active, b) for b in balance_refs(e))))
+        out.append(custom_balance_tcl(e, tag, "in_ring", active))
         out.append("set rg%d [stack 0]" % i)
     acc = "$rg0"
     for i in range(1, RING_SLOTS):
@@ -767,7 +1178,8 @@ def _caustic_tcl():
     pos = _safe_pos(p(e, "Position"))
     shape = ("clamp(R-dist+0.5,0,1)*(0.12+pow(clamp(dist/R,0,1),max(0.1,%s)*4))"
              "*(0.65+0.35*cos(clamp(parent.blades,3,12)*aw))" % p(e, "Sharpness"))
-    body = _coloured_axial(e, "caustic", pos, _on(e), shape, "%s*%s" % (p(e, "Size"), RES), "1")
+    body = _coloured_axial(e, "caustic", pos, _on(e), shape, "%s*%s" % (p(e, "Size"), RES), "1",
+                           custom=("in_caustic", custom_active("causticShape", "Caustic")))
     return "\n".join([_source(e, True), body, offset_tcl(e, "causticOffsetT"), "set el_%s [stack 0]" % e])
 
 
@@ -783,15 +1195,13 @@ def _ring_halo_tcl():
     orb_off = "{{!parent.%sOn||%s==1}}" % (e, mode)
     even_off = "{{!parent.%sOn||%s==1||%s>=1}}" % (e, mode, p(e, "Arc"))     # Arc 1 never reads it
     halo_off = "{{!parent.%sOn||%s==0}}" % (e, mode)
-    sig = "%s*%s/2.355" % (p(e, "Width"), RES)
-    s = "hypot(%s,%g)" % (sig, AA)
     out = [_source(e, True)]
     # Optical Centre (orbital / rainbow ring) branch.
     out.append("push $%s_src\nBlur {\n channels rgb\n size {{max(1,%s*%s)}}\n disable %s\n name ringHaloReach\n}"
                "\nset rhD [stack 0]" % (e, p(e, "ArcFalloff"), RES, orb_off))
     out.append("push $%s_src\nBlur {\n channels rgb\n size {{4*%s}}\n disable %s\n name ringHaloEven\n}"
                "\nset rhE [stack 0]" % (e, FW, even_off))
-    u = ring_band(e, "dd-rr", s)
+    u = ring_band(e, "dd-rr")
     nz = noise_expr(e, "atan2(y+0.5-%s,x+0.5-%s)" % (CY, CX))
     # The even blur is spread far wider than the reach blur; scale it to the
     # peak level of a reach blur of fixed size EVEN_REF_PX, so the even field
@@ -805,20 +1215,24 @@ def _ring_halo_tcl():
     out.append("push $rhD\npush $rhE\nMergeExpression {\n inputs 2\n"
                " temp_name0 dd\n temp_expr0 {hypot(x+0.5-%s,y+0.5-%s)}\n"
                " temp_name1 rr\n temp_expr1 {%s*%s}\n"
-               " temp_name2 mm\n temp_expr2 {exp(-pow((dd-rr)/%s,2)/2)*%s}\n"
+               " temp_name2 mm\n temp_expr2 {%s*%s}\n"
                "%s\n expr3 0\n disable %s\n name ringHaloOrbital\n}\nset rhO [stack 0]"
-               % (CX, CY, p(e, "Radius"), FH, s, nz, "\n".join(rows), orb_off))
+               % (CX, CY, p(e, "Radius"), FH, profile("dd-rr", e), nz, "\n".join(rows), orb_off))
     # Light (halo) branch.
-    shape, hu, band = ring_profile(e, sig)
+    shape, hu, band = ring_profile(e)
     lines = coloured_kernel_lines(e, shape_temps("%s*%s" % (p(e, "Radius"), FH)), shape, hu, band, "aw")
-    out.append("push $hl\nExpression {\n%s\n disable %s\n name ringHaloKernel\n}" % ("\n".join(with_floor(lines)), halo_off))
+    kernel = "push $hl\nExpression {\n%s\n disable %s\n name ringHaloKernel\n}" % ("\n".join(with_floor(lines)), halo_off)
+    active = custom_active("ringHaloShape", "Ring", "%s==1" % mode)
+    out.append(pick_kernel_tcl("rhK", kernel, custom_kernel_tcl(e, "ringHalo", "in_ring", "%s*%s" % (p(e, "Radius"), FH),
+                                                              halo_off.strip("{}"), active, True), active))
     out.append("set rhK [stack 0]")
     out.append(coloured_conv_tcl(e, "rhK", "%s_src" % e, halo_off.strip("{}"), "ringHaloHalo"))
     out.append("set rhH [stack 0]")
     out.append("push $rhH\npush $rhO\nSwitch {\n inputs 2\n which {{%s}}\n name ringHaloPick\n}" % mode)
     # Light mode is a normalized convolution and needs the balance; Optical
     # Centre mode applies the colour per pixel, unnormalized.
-    out.append(_gain(e, "ringHaloGain", "1", tuple("(%s==1?%s:1)" % (mode, b) for b in balance_refs(e))))
+    out.append(_gain(e, "ringHaloGain", "1", tuple("(%s==1?((%s)?1:%s):1)" % (mode, active, b) for b in balance_refs(e))))
+    out.append(custom_balance_tcl(e, "ringHaloG", "in_ring", active))
     out.append(offset_tcl(e, "ringHaloOffsetT"))
     out.append("set el_%s [stack 0]" % e)
     return "\n".join(out)
@@ -925,10 +1339,21 @@ def element_vars():
 
 # -- knobs (needs nuke) -------------------------------------------------------------------
 
+def bool_knob(nuke, name, label, value):
+    """A checkbox that keeps its state when the script is saved and reopened. A Boolean_Knob made with a True
+    constructor default is NOT written to the script (Nuke thinks True is its default) and comes back off, so the
+    value is set after construction instead."""
+    k = nuke.Boolean_Knob(name, label)
+    k.setValue(bool(value))
+    return k
+
+
 def _make_knob(nuke, name, lab, kind, lo, hi, default, tip):
     if kind.startswith("e:"):
         k = nuke.Enumeration_Knob(name, lab, kind[2:].split("|"))
         k.setValue(int(default))
+    elif kind == "b":
+        k = bool_knob(nuke, name, lab, default)
     elif kind == "i":
         k = nuke.Int_Knob(name, lab)
         k.setRange(lo, hi)
@@ -949,8 +1374,6 @@ def colour_knobs(nuke, prefix):
     """The ring colour system knobs for one element (or 'ghosts')."""
     knobs = []
     for s, lab, kind, lo, hi, d, tip in COLOUR_EXTRA:
-        if s == "ColorWidth" and prefix in RING_TYPES:
-            d = 1.0
         knobs.append(_make_knob(nuke, prefix + s, lab, kind, lo, hi, d, tip))
     for i, (col, pos) in enumerate(RAMP_DEFAULTS):
         c = nuke.Color_Knob("%sRamp%d" % (prefix, i), "Ramp %d" % (i + 1))
@@ -959,6 +1382,49 @@ def colour_knobs(nuke, prefix):
         knobs.append(_make_knob(nuke, "%sRampPos%d" % (prefix, i), "Position", "d", 0, 1, pos,
                                 "Where this colour sits across the band (0 = inside, 1 = outside). "
                                 "Positions should increase from stop 1 to 4."))
+    return knobs
+
+
+STREAK_STEP_SCRIPT = "import sid_flare_elements\nsid_flare_elements.streak_step(nuke.thisNode(), %d)\n"
+
+
+def streak_knobs(nuke, src):
+    """Streak group body (after Enable): shared Source, + / - buttons, the
+    hidden Streak Count, then STREAK_SLOTS slots. Slots past Count are hidden
+    (sync_offset_visibility re-applies this on load)."""
+    e = "streak"
+    knobs = []
+    srck = nuke.Enumeration_Knob(e + "Source", "Source", SOURCES)
+    srck.setValue(src)
+    srck.setTooltip("All highlights: every bright pixel. Hotspot: one point per light.")
+    knobs.append(srck)
+    add = nuke.PyScript_Knob(e + "Add", "+", STREAK_STEP_SCRIPT % 1)
+    add.setTooltip("Add a streak (up to %d)." % STREAK_SLOTS)
+    add.setFlag(nuke.STARTLINE)
+    rem = nuke.PyScript_Knob(e + "Remove", "-", STREAK_STEP_SCRIPT % -1)
+    rem.setTooltip("Remove the last streak (at least one stays).")
+    count = nuke.Int_Knob(e + "Count", "Streak Count")
+    count.setValue(1)
+    count.setFlag(nuke.INVISIBLE)
+    knobs += [add, rem, count]
+    for i in range(STREAK_SLOTS):
+        pf = streak_slot_prefix(i)
+        slot = [nuke.Text_Knob(pf + "Hdr", "<b>Streak %d</b>" % (i + 1), "")]
+        inten = nuke.Double_Knob(pf + "Intensity", "Intensity")
+        inten.setRange(0, DEFAULT_INTENSITY[e] * 10)
+        inten.setValue(DEFAULT_INTENSITY[e])
+        tint = nuke.Color_Knob(pf + "Tint", "Tint")
+        tint.setValue([1.0, 1.0, 1.0])
+        slot += [inten, tint]
+        for suffix, lab, kind, lo, hi, default, tip in EXTRA[e]:
+            if suffix == "Angle":
+                default = STREAK_DEFAULT_ANGLES[i]
+            slot.append(_make_knob(nuke, pf + suffix, lab, kind, lo, hi, default, tip))
+        offs = offset_knobs(nuke, pf)
+        if i > 0:
+            for k in slot + offs[:1]:
+                k.setVisible(False)
+        knobs += slot + offs
     return knobs
 
 
@@ -975,6 +1441,11 @@ def add_element_knobs(group, nuke, center_knob=None):
     for eid, label, family, src in ELEMENTS:
         group.addKnob(nuke.Tab_Knob("grp_" + eid, label, nuke.TABBEGINCLOSEDGROUP))
         group.addKnob(nuke.Boolean_Knob(eid + "On", "Enable", False))
+        if eid == "streak":
+            for k in streak_knobs(nuke, src):
+                group.addKnob(k)
+            group.addKnob(nuke.Tab_Knob("grp_%s_end" % eid, "", nuke.TABENDGROUP))
+            continue
         inten = nuke.Double_Knob(eid + "Intensity", "Intensity")
         inten.setRange(0, DEFAULT_INTENSITY[eid] * 10)
         inten.setValue(DEFAULT_INTENSITY[eid])
