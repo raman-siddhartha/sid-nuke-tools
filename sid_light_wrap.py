@@ -6,8 +6,8 @@
 #
 # Install:
 #   Add to menu.py:
-#       import sid_light_wrap2
-#       sid_light_wrap2.install_menu()
+#       import sid_light_wrap
+#       sid_light_wrap.install_menu()
 #   Nodes > Sid then provides "Light Wrap".
 #
 
@@ -1074,7 +1074,7 @@ def make_light_wrap():
         _add_credit_knob(group)
 
         group["knobChanged"].setValue(
-            "import sid_light_wrap2 as _lw\n"
+            "import sid_light_wrap as _lw\n"
             "k = nuke.thisKnob()\n"
             "if k is not None and k.name() in ('lwCoverage', 'lwNormalSource', 'lwRelight', 'lwUseNormalsInput'):\n"
             "    _lw._update_light_wrap_ui(nuke.thisNode())\n"

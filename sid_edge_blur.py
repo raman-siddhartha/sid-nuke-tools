@@ -6,8 +6,8 @@
 #
 # Install:
 #   Add to menu.py:
-#       import sid_edge_blur2
-#       sid_edge_blur2.install_menu()
+#       import sid_edge_blur
+#       sid_edge_blur.install_menu()
 #   Nodes > Sid then also provides "Edge Extend Blur".
 #
 # Strict ASCII.
@@ -800,7 +800,7 @@ def make_edge_extend():
         _add_credit_knob(group)
 
         group["knobChanged"].setValue(
-            "import sid_edge_blur2 as _se\n"
+            "import sid_edge_blur as _se\n"
             "k = nuke.thisKnob()\n"
             "if k is not None and k.name() in ('extendMethod', 'useSample'):\n"
             "    _se._update_edge_extend_ui(nuke.thisNode())\n"
