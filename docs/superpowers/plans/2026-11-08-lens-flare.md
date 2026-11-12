@@ -1494,13 +1494,13 @@ Expected: `SYNCED`
 In `F:\Python\Nuke\README.txt`, replace:
 
 ```
-sid_edge_extend_blur.py - Edge Extend Blur (Edge Extend + final edge blur)
+sid_edge_extend.py   - Edge Extend Blur
 ```
 
 with:
 
 ```
-sid_edge_extend_blur.py - Edge Extend Blur (Edge Extend + final edge blur)
+sid_edge_extend.py   - Edge Extend Blur
 sid_lens_flare.py    - Lens Flare (needs sid_lens_optics.py next to it)
 ```
 

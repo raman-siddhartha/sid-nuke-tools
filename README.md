@@ -4,8 +4,8 @@ Sid Nuke Tools
 Contents
 --------
 sid_match_tools.py   - Neutralize, Match Black, Match White, Match Colour
-sid_edge_extend.py   - Alpha Edge
-sid_edge_blur.py     - Edge Extend Blur
+sid_alpha_edge.py    - Alpha Edge
+sid_edge_extend.py   - Edge Extend Blur
 sid_light_wrap.py    - Light Wrap
 sid_lens_flare.py    - Lens Flare (needs sid_lens_optics.py,
                        sid_flare_elements.py, sid_flare_dirt.py,
@@ -57,14 +57,14 @@ before. With it on, brightness and saturation-strength are matched as
 two separate quantities, which stays correct even when Target has had
 its Saturation or Gamma adjusted after the original grade.
 
-Alpha Edge (sid_edge_extend.py)
+Alpha Edge (sid_alpha_edge.py)
 -------------------------------
 Alpha-only processor - grow/shrink (in sub-pixel 0.1 px steps), edge smoothing, contrast, and
 blur. Takes a Mask input and a Mix slider for standard masked/partial
 application.
 
 
-Edge Extend Blur (sid_edge_blur.py)
+Edge Extend Blur (sid_edge_extend.py)
 --------------------------------------
 Cleans the RGB edge of a keyed or rotoed element so it blends into a new
 background without a dark or bright rim. Alpha is never changed.
