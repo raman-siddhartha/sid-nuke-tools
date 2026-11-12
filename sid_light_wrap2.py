@@ -1,4 +1,4 @@
-# Sid VFX Suite for Nuke -- Light Wrap 2
+# Sid VFX Suite for Nuke -- Light Wrap
 # Normal-driven light wrap. The BG light is not blurred in place: for every pixel near the FG edge the wrap colour is
 # fetched from the BG along the edge NORMAL (the direction pointing out of the FG, taken from the gradient of a
 # smoothed alpha), so the light wraps around the shape instead of forming rings. Wrap amount falls off smoothly with
@@ -8,7 +8,7 @@
 #   Add to menu.py:
 #       import sid_light_wrap2
 #       sid_light_wrap2.install_menu()
-#   Nodes > Sid then provides "Light Wrap 2".
+#   Nodes > Sid then provides "Light Wrap".
 #
 
 import nuke
@@ -802,7 +802,7 @@ _TCL = """
 
 
 def make_light_wrap():
-    group, selected = _create_sid_group("LightWrap2")
+    group, selected = _create_sid_group("LightWrap")
     tcl = _TCL.replace("@R@", _channel_expr("r")).replace("@G@", _channel_expr("g")).replace("@B@", _channel_expr("b"))
     with group:
         nuke.tcl(tcl)
@@ -1088,5 +1088,5 @@ def make_light_wrap():
 
 def install_menu():
     m = nuke.menu("Nodes").addMenu("Sid", icon=None)
-    m.addCommand("Light Wrap 2", make_light_wrap)
+    m.addCommand("Light Wrap", make_light_wrap)
     nuke.addOnCreate(_on_group_create, nodeClass="Group")

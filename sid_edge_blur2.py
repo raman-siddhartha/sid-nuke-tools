@@ -1,4 +1,4 @@
-# Sid VFX Suite for Nuke -- Edge Extend Blur 2
+# Sid VFX Suite for Nuke -- Edge Extend Blur
 # Working copy of the ORIGINAL Edge Extend Blur (as released on GitHub, before the Edge Extend rewrite). Edit this
 # file; the shipped modules are left untouched. Original header: copy of Edge Extend, with one
 # addition: a final Edge Blur stage applied after every other operation
@@ -8,7 +8,7 @@
 #   Add to menu.py:
 #       import sid_edge_blur2
 #       sid_edge_blur2.install_menu()
-#   Nodes > Sid then also provides "Edge Extend Blur 2".
+#   Nodes > Sid then also provides "Edge Extend Blur".
 #
 # Strict ASCII.
 
@@ -127,7 +127,7 @@ _EDGE_W = "clamp(max((z0+z1+z2+z3)/8,%s),0,1)" % _ROTO_CUT
 
 
 def make_edge_extend():
-    group, selected = _create_sid_group("EdgeExtendBlur2")
+    group, selected = _create_sid_group("EdgeExtendBlur")
     with group:
         nuke.tcl("""
             Input {
@@ -830,5 +830,5 @@ def _on_group_create():
 
 def install_menu():
     m = nuke.menu("Nodes").addMenu("Sid", icon=None)
-    m.addCommand("Edge Extend Blur 2", make_edge_extend)
+    m.addCommand("Edge Extend Blur", make_edge_extend)
     nuke.addOnCreate(_on_group_create, nodeClass="Group")

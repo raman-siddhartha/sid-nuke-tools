@@ -5,8 +5,8 @@ Contents
 --------
 sid_match_tools.py   - Neutralize, Match Black, Match White, Match Colour
 sid_edge_extend.py   - Alpha Edge
-sid_edge_blur2.py    - Edge Extend Blur 2
-sid_light_wrap2.py   - Light Wrap 2
+sid_edge_blur2.py    - Edge Extend Blur
+sid_light_wrap2.py   - Light Wrap
 sid_lens_flare.py    - Lens Flare (needs sid_lens_optics.py and
                        sid_flare_elements.py next to it)
 menu.py              - registers all of the above under Nodes > Sid
@@ -62,7 +62,7 @@ blur. Takes a Mask input and a Mix slider for standard masked/partial
 application.
 
 
-Edge Extend Blur 2 (sid_edge_blur2.py)
+Edge Extend Blur (sid_edge_blur2.py)
 --------------------------------------
 Cleans the RGB edge of a keyed or rotoed element so it blends into a new
 background without a dark or bright rim. Alpha is never changed.
@@ -80,7 +80,7 @@ Inputs: Source, Sample, Mask, Omit.
   colour-only blur in 0.1 steps.
 - Premult Input / Output are off by default.
 
-Light Wrap 2 (sid_light_wrap2.py)
+Light Wrap (sid_light_wrap2.py)
 ---------------------------------
 Light wrap that follows the shape of the foreground, built on normals.
 Inputs: FG, BG, Mask, Normals (optional).
