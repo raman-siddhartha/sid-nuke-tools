@@ -6,6 +6,7 @@ Contents
 sid_match_tools.py   - Neutralize, Match Black, Match White, Match Colour
 sid_edge_extend.py   - Alpha Edge
 sid_edge_blur2.py    - Edge Extend Blur 2
+sid_light_wrap2.py   - Light Wrap 2
 sid_lens_flare.py    - Lens Flare (needs sid_lens_optics.py and
                        sid_flare_elements.py next to it)
 menu.py              - registers all of the above under Nodes > Sid
@@ -78,6 +79,31 @@ Inputs: Source, Sample, Mask, Omit.
 - Show Edge Matte (checkbox) shows the treated band. Edge Blur is a final
   colour-only blur in 0.1 steps.
 - Premult Input / Output are off by default.
+
+Light Wrap 2 (sid_light_wrap2.py)
+---------------------------------
+Light wrap that follows the shape of the foreground, built on normals.
+Inputs: FG, BG, Mask, Normals (optional).
+- Normals cover the whole FG. Normal Source: Alpha Dome (silhouette only),
+  Image Detail + Dome (default: the FG's own luminance, bright = raised, adds
+  the surface detail) or Image Detail Only. Normal Blur, Normal Smooth,
+  Normal Height, Detail Strength, Detail Smoothing, Flip Normals and
+  Normal Strength adjust them; View Normals shows them as colour.
+- The wrap colour is the diffuse BG picked up along the normal (BG Reach).
+- Coverage: Edge Only (Edge Width), Grow Inwards (Wrap Depth) or Whole
+  Object. Controls that do nothing in the current mode are greyed out.
+  Wrap Softness smooths where the wrap ends.
+- Relight (checkbox): the same normals light the FG with a direction,
+  elevation, colour, intensity, softness and ambient; the wrap is applied on
+  top of the relit FG.
+- Output Mode: FG Only, FG Over BG, LightWrap Only (solo on black) or
+  Normals (raw, -1..1 float RGB with the FG alpha, for use in other relight
+  setups). Use Normals Input swaps in a normal map of your own (encoded 0..1
+  or raw -1..1, green = up).
+- Blend Modes: Add, Screen, SoftLight, BG Bleed. Premult Input / Output are
+  off by default.
+- The normals come from the alpha and the image luminance, not true depth;
+  a real normal map on the Normals input is more accurate.
 
 Lens Flare (sid_lens_flare.py + sid_lens_optics.py)
 ------------------------------------------------------

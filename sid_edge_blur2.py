@@ -818,6 +818,17 @@ def make_edge_extend():
 # INSTALL MENU
 # =============================================================================
 
+def _on_group_create():
+    """Re-applies which controls are shown / enabled when a saved script is opened (Nuke does not keep that)."""
+    try:
+        node = nuke.thisNode()
+        if "useSample" in node.knobs() and "extendMethod" in node.knobs():
+            _update_edge_extend_ui(node)
+    except Exception:
+        pass
+
+
 def install_menu():
     m = nuke.menu("Nodes").addMenu("Sid", icon=None)
     m.addCommand("Edge Extend Blur 2", make_edge_extend)
+    nuke.addOnCreate(_on_group_create, nodeClass="Group")

@@ -9,3 +9,6 @@ sid_lens_flare.install_menu()
 
 import sid_edge_blur2
 sid_edge_blur2.install_menu()
+
+import sid_light_wrap2
+sid_light_wrap2.install_menu()
