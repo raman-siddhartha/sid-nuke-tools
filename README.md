@@ -11,6 +11,8 @@ sid_lens_flare.py    - Lens Flare (needs sid_lens_optics.py,
                        sid_flare_elements.py, sid_flare_dirt.py,
                        sid_flare_inputs.py and sid_flare_presets.py
                        next to it)
+connect_node.py      - Connect node: a live pointer to another node, with
+                       Favourites hub (standalone, see below)
 menu.py              - registers all of the above under Nodes > Sid
 
 Install
@@ -21,6 +23,13 @@ Install
 2. If you already have a menu.py there, merge the registration lines from this
    one into it instead of overwriting your existing file.
 3. Restart Nuke. Nodes > Sid will list all the tools.
+
+Connect Node (connect_node.py)
+-----------------------------
+Standalone. Not registered by menu.py. Either paste the file into the Script
+Editor to open the Connect popup, or from your menu.py use
+    import connect_node
+    nuke.menu('Nodes').addCommand('Sid/Connect', connect_node.show_menu)
 
 Match Tools (sid_match_tools.py)
 ---------------------------------
