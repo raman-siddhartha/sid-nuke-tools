@@ -12,3 +12,7 @@ sid_edge_extend.install_menu()
 
 import sid_light_wrap
 sid_light_wrap.install_menu()
+
+import nuke
+import connect_node
+nuke.menu('Nodes').addMenu('Sid', icon=None).addCommand('Connect', connect_node.show_menu)
