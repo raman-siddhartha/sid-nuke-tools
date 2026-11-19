@@ -664,6 +664,19 @@ def show_menu():
         ACTIONS[choice][1]()
 
 
+def show_qmenu():
+    # Popup menu at the mouse cursor, one entry per action. Bound to Ctrl+Tab in menu.py.
+    try:
+        from PySide6 import QtWidgets, QtGui
+    except ImportError:
+        from PySide2 import QtWidgets, QtGui
+    menu = QtWidgets.QMenu(QtWidgets.QApplication.activeWindow())
+    for label, fn in ACTIONS:
+        act = menu.addAction(label)
+        act.triggered.connect(lambda checked=False, f=fn: f())
+    menu.exec_(QtGui.QCursor.pos())
+
+
 # Only runs when pasted into the Script Editor. Importing from menu.py does nothing.
 if __name__ == '__main__':
     show_menu()
