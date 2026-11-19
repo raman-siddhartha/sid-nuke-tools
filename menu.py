@@ -15,4 +15,8 @@ sid_light_wrap.install_menu()
 
 import nuke
 import connect_node
-nuke.menu('Nodes').addMenu('Sid', icon=None).addCommand('Connect', connect_node.show_menu)
+_cm = nuke.menu('Nodes').addMenu('Sid', icon=None).addMenu('Connect')
+_cm.addCommand('Connect Menu...', connect_node.show_menu, 'ctrl+Tab')
+_cm.addSeparator()
+for _label, _fn in connect_node.ACTIONS:
+    _cm.addCommand(_label, _fn)

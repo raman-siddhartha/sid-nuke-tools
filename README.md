@@ -26,7 +26,8 @@ Install
 
 Connect Node (connect_node.py)
 -----------------------------
-Registered by menu.py as Nodes > Sid > Connect (opens the Connect popup).
+Registered by menu.py as Nodes > Sid > Connect (one entry per action) and
+Ctrl+Tab opens the Connect popup.
 You can also paste the file into the Script Editor to open the same popup.
 
 Match Tools (sid_match_tools.py)
