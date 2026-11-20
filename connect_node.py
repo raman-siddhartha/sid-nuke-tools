@@ -422,7 +422,7 @@ def open_selected_source():
 def pick_favourite():
     # Called from the Pick Favourite button on a Connect or dummy node.
     n = nuke.thisNode()
-    names = []
+    names = [x for x in fav_names() if nuke.toNode(x) is not None]
     for hub in nuke.allNodes():
         if 'isFavHub' in hub.knobs():
             for i in range(hub.inputs()):
@@ -430,7 +430,7 @@ def pick_favourite():
                 if f is not None and f.name() not in names:
                     names.append(f.name())
     if not names:
-        nuke.message('No favourites yet. Create a Favourites node and add some.')
+        nuke.message('No favourites yet. Open Favourites panel and click Add Selected.')
         return
     panel = nuke.Panel('Pick Favourite')
     panel.addEnumerationPulldown('Favourite', ' '.join(names))
@@ -493,9 +493,58 @@ def all_hubs():
     return [x for x in nuke.allNodes() if 'isFavHub' in x.knobs()]
 
 
+def _fav_file():
+    import os
+    return os.path.join(os.path.expanduser('~'), '.nuke', 'sid_favourites.json')
+
+
+def fav_names():
+    # Favourite node names saved in ~/.nuke/sid_favourites.json. No Favourites node needed.
+    import json
+    try:
+        with open(_fav_file()) as fh:
+            return [str(x) for x in json.load(fh)]
+    except (IOError, OSError, ValueError):
+        return []
+
+
+def fav_save(names):
+    import json
+    with open(_fav_file(), 'w') as fh:
+        json.dump(names, fh, indent=1)
+
+
 def fav_entries():
-    # (hub, slot, favourite) for every wired favourite in the graph.
-    return [(h, i, h.input(i)) for h in all_hubs() for i in range(h.inputs()) if h.input(i) is not None]
+    # (None, name, node) for every favourite that exists in the open script.
+    # Wired favourites on any Favourites node are listed too.
+    out = []
+    seen = set()
+    for name in fav_names():
+        node = nuke.toNode(name)
+        if node is not None:
+            out.append((None, name, node))
+            seen.add(node.fullName())
+    for h in all_hubs():
+        for i in range(h.inputs()):
+            f = h.input(i)
+            if f is not None and f.fullName() not in seen:
+                out.append((h, i, f))
+                seen.add(f.fullName())
+    return out
+
+
+def selected_nodes_safe():
+    # nuke.selectedNodes(), with the TCL selection as a fallback.
+    sel = list(nuke.selectedNodes())
+    if not sel:
+        try:
+            for ident in nuke.tcl('selected_nodes').split():
+                n = nuke.toNode(nuke.tcl('value %s.name' % ident))
+                if n is not None:
+                    sel.append(n)
+        except Exception:
+            pass
+    return sel
 
 
 def add_favourites(hub, nodes):
@@ -590,17 +639,16 @@ def favourites_panel():
         return shown[idx] if idx >= 0 else None
 
     def add(*_):
-        sel = [x for x in nuke.selectedNodes() if 'isFavHub' not in x.knobs()]
+        sel = [x for x in selected_nodes_safe() if 'isFavHub' not in x.knobs()]
         if not sel:
-            nuke.message('Select the nodes you want as favourites in the graph, then click Add Selected.')
+            nuke.message('No node selected in the Node Graph. Click a node there, then click Add Selected.')
             return
-        hubs = all_hubs()
-        hub = hubs[0] if hubs else make_favourites_hub()
-        failed = add_favourites(hub, sel)
-        fav_rebuild(hub)
+        names = fav_names()
+        for x in sel:
+            if x.fullName() not in names:
+                names.append(x.fullName())
+        fav_save(names)
         fill()
-        if failed:
-            nuke.message('Nuke would not accept these as favourites:\n' + '\n'.join(failed))
 
     def open_props(*_):
         entry = current()
@@ -620,8 +668,11 @@ def favourites_panel():
     def remove(*_):
         entry = current()
         if entry is not None:
-            entry[0].setInput(entry[1], None)
-            fav_rebuild(entry[0])
+            if entry[0] is None:
+                fav_save([n for n in fav_names() if n != entry[1]])
+            else:
+                entry[0].setInput(entry[1], None)
+                fav_rebuild(entry[0])
             fill()
 
     def refresh(*_):
