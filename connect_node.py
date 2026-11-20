@@ -217,14 +217,9 @@ def children_of(node):
     return [x for x in all_connects() if x.input(0) is not None and x.input(0).fullName() == node.fullName()]
 
 
-def make_on_selected():
+def connect_to(src):
     # First time on a node: a parent Connect next to it plus a child wired to the parent.
-    # Any later time on the same node (or on the parent itself): just one more child.
-    sel = nuke.selectedNodes()
-    if len(sel) != 1:
-        nuke.message('Select exactly one node first, then try again.')
-        return None
-    src = sel[0]
+    # Any later time on the same node (or on a Connect node itself): just one more child.
     if 'connectNode' in src.knobs():
         parent = src
     else:
@@ -233,8 +228,15 @@ def make_on_selected():
     if parent is None:
         return None
     count = len(children_of(parent))
-    child = make_node(source=parent, pos=(parent.xpos(), parent.ypos() + 80 + 60 * count))
-    return child
+    return make_node(source=parent, pos=(parent.xpos(), parent.ypos() + 80 + 60 * count))
+
+
+def make_on_selected():
+    sel = nuke.selectedNodes()
+    if len(sel) != 1:
+        nuke.message('Select exactly one node first, then try again.')
+        return None
+    return connect_to(sel[0])
 
 
 _panel = None
@@ -589,9 +591,89 @@ def favourites_panel():
     dlg.show()
 
 
+def quick_connect():
+    # Ctrl+Tab: type part of a node name, arrow keys pick a row, Enter connects to it.
+    # Connect nodes and favourites are listed first. Esc or a click outside closes it.
+    try:
+        from PySide6 import QtWidgets, QtGui, QtCore
+    except ImportError:
+        from PySide2 import QtWidgets, QtGui, QtCore
+    global _quick
+    if _quick is not None:
+        _quick.close()
+
+    favs = set(fav_names())
+    rows = []
+    for x in nuke.allNodes():
+        name = x.fullName()
+        kind = 'Connect' if 'connectNode' in x.knobs() else x.Class()
+        rank = 0 if kind == 'Connect' else (1 if name in favs else 2)
+        rows.append((rank, name.lower(), name, kind, '  *' if name in favs else ''))
+    rows.sort()
+
+    dlg = QtWidgets.QDialog(QtWidgets.QApplication.activeWindow(),
+                            QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint)
+    dlg.setMinimumWidth(320)
+    layout = QtWidgets.QVBoxLayout(dlg)
+    layout.setContentsMargins(6, 6, 6, 6)
+    box = QtWidgets.QLineEdit()
+    box.setPlaceholderText('Connect to node...')
+    layout.addWidget(box)
+    lst = QtWidgets.QListWidget()
+    lst.setFocusPolicy(QtCore.Qt.NoFocus)
+    lst.setMaximumHeight(260)
+    layout.addWidget(lst)
+
+    def fill(*_):
+        text = box.text().strip().lower()
+        lst.clear()
+        for rank, low, name, kind, star in rows:
+            if text and text not in low and text not in kind.lower():
+                continue
+            item = QtWidgets.QListWidgetItem('%s    (%s)%s' % (name, kind, star))
+            item.setData(QtCore.Qt.UserRole, name)
+            lst.addItem(item)
+            if lst.count() >= 40:
+                break
+        if lst.count():
+            lst.setCurrentRow(0)
+
+    def go(*_):
+        item = lst.currentItem()
+        if item is None:
+            return
+        node = nuke.toNode(item.data(QtCore.Qt.UserRole))
+        dlg.close()
+        if node is not None:
+            connect_to(node)
+
+    class Keys(QtCore.QObject):
+        def eventFilter(self, obj, ev):
+            if ev.type() == QtCore.QEvent.KeyPress and ev.key() in (QtCore.Qt.Key_Down, QtCore.Qt.Key_Up):
+                row = lst.currentRow() + (1 if ev.key() == QtCore.Qt.Key_Down else -1)
+                lst.setCurrentRow(max(0, min(lst.count() - 1, row)))
+                return True
+            return False
+
+    keys = Keys(dlg)
+    box.installEventFilter(keys)
+    box.textChanged.connect(fill)
+    box.returnPressed.connect(go)
+    lst.itemClicked.connect(go)
+    fill()
+    pos = QtGui.QCursor.pos()
+    dlg.move(pos.x() - 20, pos.y() - 20)
+    _quick = dlg
+    dlg.show()
+    box.setFocus()
+
+
+_quick = None
+
+
 ACTIONS = [
-    ('Create Connect node on selected', make_on_selected),
-    ('Create Connect node', make_node),
+    ('Quick Connect (Ctrl+Tab)', quick_connect),
+    ('Connect selected node', make_on_selected),
     ('Create Dummy node', lambda: make_node(dummy=True)),
     ('List all Connect nodes', list_all),
     ('Select broken Connect nodes', select_broken),
@@ -606,19 +688,6 @@ def show_menu():
     choice = nuke.choice('Connect', 'What do you want to do?', [label for label, _ in ACTIONS])
     if choice is not None:
         ACTIONS[choice][1]()
-
-
-def show_qmenu():
-    # Popup menu at the mouse cursor, one entry per action. Bound to Ctrl+Tab in menu.py.
-    try:
-        from PySide6 import QtWidgets, QtGui
-    except ImportError:
-        from PySide2 import QtWidgets, QtGui
-    menu = QtWidgets.QMenu(QtWidgets.QApplication.activeWindow())
-    for label, fn in ACTIONS:
-        act = menu.addAction(label)
-        act.triggered.connect(lambda checked=False, f=fn: f())
-    menu.exec_(QtGui.QCursor.pos())
 
 
 # Only runs when pasted into the Script Editor. Importing from menu.py does nothing.
