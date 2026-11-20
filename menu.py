@@ -15,6 +15,7 @@ sid_light_wrap.install_menu()
 
 import nuke
 import connect_node
+connect_node.install()
 _cm = nuke.menu('Nodes').addMenu('Sid', icon=None).addMenu('Connect')
 _cm.addCommand('Quick Connect', connect_node.quick_connect, 'ctrl+Tab')
 _cm.addCommand('Connect Selected Node', connect_node.make_on_selected)

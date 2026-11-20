@@ -41,6 +41,8 @@ color = OK_COLOR if ok else 0xFF000000
 p = n.input(0)
 if p is not None and n['connectNode'].value() != p.name():
     n['connectNode'].setValue(p.name())
+if p is not None and 'connectParent' in n.knobs() and n['connectParent'].value() and n['connectParent'].value() != p.name() and 'connectNode' in p.knobs() and not ('connectParent' in p.knobs() and p['connectParent'].value()):
+    n['connectParent'].setValue(p.name())
 if n['parentInfo'].value() != info:
     n['parentInfo'].setValue(info)
 if n['tile_color'].value() != color:
@@ -188,8 +190,9 @@ def make_node(dummy=False, source=None, pos=None, base=None):
             name = unique_name(name.rstrip('0123456789_') or 'Dummy_Node')
     n = nuke.nodes.NoOp(name=name)
     n['hide_input'].setValue(True)
-    # The first label line is the stable title. Nuke renames pasted nodes (plate_connect_child1), the title stays.
-    n['label'].setValue((title + '\n' if title else '') + (LABEL.replace('Connected to', 'Dummy to') if dummy else LABEL))
+    n['label'].setValue(LABEL.replace('Connected to', 'Dummy to') if dummy else LABEL)
+    # The name line on the node shows the stable title, never Nuke's numbered name (plate_connect_child1).
+    n['autolabel'].setValue("nuke.thisNode()['connectTitle'].value() or nuke.thisNode().name()")
     n['tile_color'].setValue(BROKEN_COLOR)
     n['note_font_size'].setValue(LABEL_SIZE)
     if pos is not None:
@@ -205,6 +208,18 @@ def make_node(dummy=False, source=None, pos=None, base=None):
     name_knob.setFlag(nuke.DO_NOT_WRITE)
     n.addKnob(name_knob)
     n.addKnob(nuke.Text_Knob('parentInfo', 'Connected To', 'Nothing'))
+
+    title_knob = nuke.String_Knob('connectTitle', 'Title')
+    title_knob.setFlag(nuke.INVISIBLE)
+    n.addKnob(title_knob)
+    title_knob.setValue(title or name)
+
+    # Name of the parent, saved with the node, so a pasted child can find its way back.
+    parent_knob = nuke.String_Knob('connectParent', 'Parent')
+    parent_knob.setFlag(nuke.INVISIBLE)
+    n.addKnob(parent_knob)
+    if is_child:
+        parent_knob.setValue(source.name())
 
     base_knob = nuke.String_Knob('connectBase', 'Base Name')
     base_knob.setFlag(nuke.INVISIBLE)
@@ -631,6 +646,31 @@ def favourites_panel():
     dlg.show()
 
 
+def _reconnect_child(name):
+    # A pasted child lost its wire (or got wired to a selected node, often another child).
+    # Put it back on its parent when that parent is in the script.
+    n = nuke.toNode(name)
+    if n is None or 'connectParent' not in n.knobs() or not n['connectParent'].value():
+        return
+    up = n.input(0)
+    if up is not None and not ('connectParent' in up.knobs() and up['connectParent'].value()):
+        return
+    parent = nuke.toNode(n['connectParent'].value())
+    if parent is not None and parent.fullName() != n.fullName() and 'connectNode' in parent.knobs():
+        n.setInput(0, parent)
+        n['connectNode'].setValue(parent.name())
+
+
+def _on_create_connect():
+    n = nuke.thisNode()
+    if 'connectParent' in n.knobs() and n['connectParent'].value():
+        nuke.executeDeferred(_reconnect_child, n.fullName())
+
+
+def install():
+    nuke.addOnCreate(_on_create_connect, nodeClass='NoOp')
+
+
 def quick_connect():
     # Ctrl+Tab. With a node selected: type a name and press Enter to make base_connect_parent and
     # base_connect_child (empty = the node's own name). The list holds only Connect nodes: pick one
@@ -655,8 +695,7 @@ def quick_connect():
             kind = 'child'
         else:
             kind = 'parent'
-        text = x['label'].value()
-        title = text.split('\n')[0] if '\n' in text else x.name()
+        title = x['connectTitle'].value() if 'connectTitle' in x.knobs() and x['connectTitle'].value() else x.name()
         target = up.name() if up is not None else 'nothing'
         rows.append((1 if kind == 'child' else 0, title.lower(), x.fullName(),
                      '%s   (%s > %s)' % (title, kind, target), kind))
