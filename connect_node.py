@@ -8,6 +8,7 @@ LABEL = "Connected to [if {[catch {value input0.name} r]} {set r nothing}; set r
 
 CONNECT_COLOR = 0x1fb8c800   # teal, connected
 DUMMY_COLOR = 0xf0901800     # orange, connected dummy
+CHILD_COLOR = 0x8a4fd000     # purple, child Connect (wired to another Connect)
 BROKEN_COLOR = 0xFF000000    # red, not connected
 LABEL_SIZE = 20
 
@@ -141,7 +142,24 @@ def unique_name(base):
     return '%s_%d' % (base, i)
 
 
-def make_node(dummy=False, source=None, pos=None):
+def free_name(name):
+    # name if free, else name1, name2 ... (what Nuke itself does on a paste).
+    if nuke.toNode(name) is None:
+        return name
+    i = 1
+    while nuke.toNode('%s%d' % (name, i)) is not None:
+        i += 1
+    return '%s%d' % (name, i)
+
+
+def base_of(connect):
+    # The name the user typed (plate), kept on the node so children and pastes keep the same title.
+    if 'connectBase' in connect.knobs() and connect['connectBase'].value():
+        return connect['connectBase'].value()
+    return connect.name().replace('_connect_parent', '').replace('_connect_child', '')
+
+
+def make_node(dummy=False, source=None, pos=None, base=None):
     # The dummy is the same node in a different colour. Point it at anything,
     # point Connect nodes at the dummy, and re-pointing the dummy moves them all.
     ref = source
@@ -149,18 +167,29 @@ def make_node(dummy=False, source=None, pos=None):
         sel = nuke.selectedNodes()
         ref = sel[0] if len(sel) == 1 else None
 
-    name = unique_name('Connect_Node')
+    is_child = source is not None and 'connectNode' in source.knobs()
+    role = 'child' if is_child else 'parent'
+    title = ''
+    if base is None and is_child:
+        base = base_of(source)
+    if base:
+        title = '%s_connect_%s' % (base, role)
+        name = free_name(title)
+    else:
+        name = unique_name('Connect_Node')
     if dummy:
         # Cancel stops creation. An empty answer keeps the default name.
         answer = nuke.getInput('Dummy node name', 'Dummy_Node_1')
         if answer is None:
             return None
         name = answer.strip().replace(' ', '_') or 'Dummy_Node_1'
+        title = name
         if nuke.toNode(name) is not None:
             name = unique_name(name.rstrip('0123456789_') or 'Dummy_Node')
     n = nuke.nodes.NoOp(name=name)
     n['hide_input'].setValue(True)
-    n['label'].setValue(LABEL.replace('Connected to', 'Dummy to') if dummy else LABEL)
+    # The first label line is the stable title. Nuke renames pasted nodes (plate_connect_child1), the title stays.
+    n['label'].setValue((title + '\n' if title else '') + (LABEL.replace('Connected to', 'Dummy to') if dummy else LABEL))
     n['tile_color'].setValue(BROKEN_COLOR)
     n['note_font_size'].setValue(LABEL_SIZE)
     if pos is not None:
@@ -176,6 +205,12 @@ def make_node(dummy=False, source=None, pos=None):
     name_knob.setFlag(nuke.DO_NOT_WRITE)
     n.addKnob(name_knob)
     n.addKnob(nuke.Text_Knob('parentInfo', 'Connected To', 'Nothing'))
+
+    base_knob = nuke.String_Knob('connectBase', 'Base Name')
+    base_knob.setFlag(nuke.INVISIBLE)
+    n.addKnob(base_knob)
+    if base:
+        base_knob.setValue(base)
 
     marker = nuke.Boolean_Knob('isDummy', 'is dummy')
     marker.setValue(dummy)
@@ -202,7 +237,8 @@ def make_node(dummy=False, source=None, pos=None):
     n.addKnob(nuke.Text_Knob('created', '', 'Created by Sid'))
 
     # Callbacks last, so they never fire while knobs are still being added.
-    refresh = REFRESH.replace('OK_COLOR', hex(DUMMY_COLOR if dummy else CONNECT_COLOR))
+    ok_color = DUMMY_COLOR if dummy else (CHILD_COLOR if is_child else CONNECT_COLOR)
+    refresh = REFRESH.replace('OK_COLOR', hex(ok_color))
     n['knobChanged'].setValue(KNOB_CHANGED + refresh)
     n['updateUI'].setValue(refresh)
 
@@ -217,14 +253,18 @@ def children_of(node):
     return [x for x in all_connects() if x.input(0) is not None and x.input(0).fullName() == node.fullName()]
 
 
-def connect_to(src):
-    # First time on a node: a parent Connect next to it plus a child wired to the parent.
-    # Any later time on the same node (or on a Connect node itself): just one more child.
+def connect_to(src, base=None):
+    # First time on a node: a parent Connect (base_connect_parent) next to it plus a child
+    # (base_connect_child) wired to the parent. Later times on the same node, or on any Connect
+    # node: only one more child, wired to the same parent. Never a second parent.
     if 'connectNode' in src.knobs():
         parent = src
+        up = src.input(0)
+        if up is not None and 'connectNode' in up.knobs():
+            parent = up
     else:
         parents = [x for x in children_of(src) if not is_dummy(x)]
-        parent = parents[0] if parents else make_node(source=src)
+        parent = parents[0] if parents else make_node(source=src, base=base or src.name())
     if parent is None:
         return None
     count = len(children_of(parent))
@@ -592,8 +632,9 @@ def favourites_panel():
 
 
 def quick_connect():
-    # Ctrl+Tab: type part of a node name, arrow keys pick a row, Enter connects to it.
-    # Connect nodes and favourites are listed first. Esc or a click outside closes it.
+    # Ctrl+Tab. With a node selected: type a name and press Enter to make base_connect_parent and
+    # base_connect_child (empty = the node's own name). The list holds only Connect nodes: pick one
+    # with the arrow keys (or a click) and Enter adds a child wired to the same parent.
     try:
         from PySide6 import QtWidgets, QtGui, QtCore
     except ImportError:
@@ -602,56 +643,76 @@ def quick_connect():
     if _quick is not None:
         _quick.close()
 
-    favs = set(fav_names())
+    sel = nuke.selectedNodes()
+    src = sel[0] if len(sel) == 1 else None
+
     rows = []
-    for x in nuke.allNodes():
-        name = x.fullName()
-        kind = 'Connect' if 'connectNode' in x.knobs() else x.Class()
-        rank = 0 if kind == 'Connect' else (1 if name in favs else 2)
-        rows.append((rank, name.lower(), name, kind, '  *' if name in favs else ''))
+    for x in all_connects():
+        up = x.input(0)
+        if is_dummy(x):
+            kind = 'dummy'
+        elif up is not None and 'connectNode' in up.knobs():
+            kind = 'child'
+        else:
+            kind = 'parent'
+        text = x['label'].value()
+        title = text.split('\n')[0] if '\n' in text else x.name()
+        target = up.name() if up is not None else 'nothing'
+        rows.append((1 if kind == 'child' else 0, title.lower(), x.fullName(),
+                     '%s   (%s > %s)' % (title, kind, target), kind))
     rows.sort()
+    colours = {'parent': QtGui.QColor(31, 184, 200), 'child': QtGui.QColor(138, 79, 208),
+               'dummy': QtGui.QColor(240, 144, 24)}
 
     dlg = QtWidgets.QDialog(QtWidgets.QApplication.activeWindow(),
                             QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint)
-    dlg.setMinimumWidth(320)
+    dlg.setMinimumWidth(340)
     layout = QtWidgets.QVBoxLayout(dlg)
     layout.setContentsMargins(6, 6, 6, 6)
     box = QtWidgets.QLineEdit()
-    box.setPlaceholderText('Connect to node...')
+    if src is not None:
+        box.setPlaceholderText('Name for %s  (Enter)' % src.name())
+    else:
+        box.setPlaceholderText('Select a node first, or pick a Connect below')
     layout.addWidget(box)
     lst = QtWidgets.QListWidget()
     lst.setFocusPolicy(QtCore.Qt.NoFocus)
-    lst.setMaximumHeight(260)
+    lst.setMaximumHeight(240)
     layout.addWidget(lst)
 
     def fill(*_):
         text = box.text().strip().lower()
         lst.clear()
-        for rank, low, name, kind, star in rows:
-            if text and text not in low and text not in kind.lower():
+        for rank, low, name, label, kind in rows:
+            if text and text not in low and text not in name.lower():
                 continue
-            item = QtWidgets.QListWidgetItem('%s    (%s)%s' % (name, kind, star))
+            item = QtWidgets.QListWidgetItem(label)
             item.setData(QtCore.Qt.UserRole, name)
+            item.setForeground(QtGui.QBrush(colours[kind]))
             lst.addItem(item)
             if lst.count() >= 40:
                 break
-        if lst.count():
-            lst.setCurrentRow(0)
+        lst.setCurrentRow(-1)
 
     def go(*_):
         item = lst.currentItem()
-        if item is None:
-            return
-        node = nuke.toNode(item.data(QtCore.Qt.UserRole))
         dlg.close()
-        if node is not None:
-            connect_to(node)
+        if item is not None:
+            node = nuke.toNode(item.data(QtCore.Qt.UserRole))
+            if node is not None:
+                connect_to(node)
+            return
+        if src is None:
+            nuke.message('Select a node in the Node Graph first, then press Ctrl+Tab.')
+            return
+        base = box.text().strip().replace(' ', '_') or src.name()
+        connect_to(src, base)
 
     class Keys(QtCore.QObject):
         def eventFilter(self, obj, ev):
             if ev.type() == QtCore.QEvent.KeyPress and ev.key() in (QtCore.Qt.Key_Down, QtCore.Qt.Key_Up):
                 row = lst.currentRow() + (1 if ev.key() == QtCore.Qt.Key_Down else -1)
-                lst.setCurrentRow(max(0, min(lst.count() - 1, row)))
+                lst.setCurrentRow(max(-1, min(lst.count() - 1, row)))
                 return True
             return False
 
