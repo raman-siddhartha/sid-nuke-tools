@@ -9,7 +9,6 @@ LABEL = "Connected to [if {[catch {value input0.name} r]} {set r nothing}; set r
 CONNECT_COLOR = 0x1fb8c800   # teal, connected
 DUMMY_COLOR = 0xf0901800     # orange, connected dummy
 BROKEN_COLOR = 0xFF000000    # red, not connected
-FAV_COLOR = 0x8a4fd000     # purple, favourites hub
 LABEL_SIZE = 20
 
 # Walks Connect and dummy nodes to the real source. Returns (text, ok).
@@ -88,9 +87,6 @@ def module_call(call):
 # List, tidy, repoint, find-broken and the favourites buttons live in connect_node.py.
 LIST_ALL = module_call('list_all()')
 PICK_FAVOURITE = module_call('pick_favourite()')
-FAV_CMD = module_call('fav_action()')
-FAV_ADD = module_call('fav_add()')
-FAV_REFRESH = module_call('fav_refresh()')
 
 # Opens the real source's properties, skipping any Connect or dummy nodes in between.
 OPEN_SOURCE = """
@@ -103,16 +99,6 @@ if src is None or 'connectNode' in src.knobs():
     nuke.message('Nothing to open: this node does not lead to a real source.')
 else:
     src.showControlPanel()
-"""
-
-# Keeps the favourite button labels in step with the real node names.
-FAV_RELABEL = """
-n = nuke.thisNode()
-for i in range(n.inputs()):
-    f = n.input(i)
-    k = n.knobs().get('favrow%d_open' % i)
-    if f is not None and k is not None and k.label() != f.name():
-        k.setLabel(f.name())
 """
 
 SELECT_USERS = """
@@ -423,12 +409,6 @@ def pick_favourite():
     # Called from the Pick Favourite button on a Connect or dummy node.
     n = nuke.thisNode()
     names = [x for x in fav_names() if nuke.toNode(x) is not None]
-    for hub in nuke.allNodes():
-        if 'isFavHub' in hub.knobs():
-            for i in range(hub.inputs()):
-                f = hub.input(i)
-                if f is not None and f.name() not in names:
-                    names.append(f.name())
     if not names:
         nuke.message('No favourites yet. Open Favourites panel and click Add Selected.')
         return
@@ -439,58 +419,6 @@ def pick_favourite():
         if target is not None and target.fullName() != n.fullName():
             n['connectNode'].setValue(target.name())
             n.setInput(0, target)
-
-
-def make_favourites_hub():
-    # A many-input node that keeps a real wire to each favourite, so renames never break it.
-    hub = nuke.nodes.Switch(name='Favourites')
-    hub['hide_input'].setValue(True)
-    hub['label'].setValue('Favourites')
-    hub['tile_color'].setValue(FAV_COLOR)
-    hub['note_font_size'].setValue(LABEL_SIZE)
-
-    hub.addKnob(nuke.Tab_Knob('FavTab', 'Favourites'))
-    marker = nuke.Boolean_Knob('isFavHub', 'is favourites hub')
-    marker.setFlag(nuke.INVISIBLE)
-    hub.addKnob(marker)
-    add = nuke.PyScript_Knob('favAdd', '+ Add Selected Nodes')
-    add.setCommand(FAV_ADD)
-    hub.addKnob(add)
-    refresh = nuke.PyScript_Knob('favRefresh', 'Refresh')
-    refresh.setCommand(FAV_REFRESH)
-    refresh.clearFlag(nuke.STARTLINE)
-    hub.addKnob(refresh)
-    hub.addKnob(nuke.Text_Knob('favBy', '', 'Favourites by Sid'))
-    hub.addKnob(nuke.Text_Knob('favDivTop', ''))
-
-    hub['updateUI'].setValue(FAV_RELABEL)
-    return hub
-
-
-def fav_rebuild(hub):
-    # Rows are always rebuilt from the wires, never edited one by one.
-    for k in list(hub.allKnobs()):
-        if k.name().startswith('favrow'):
-            hub.removeKnob(k)
-    for i in range(hub.inputs()):
-        f = hub.input(i)
-        if f is None:
-            continue
-        for suffix, label in [('open', f.name()), ('connect', 'Connect'), ('zoom', 'Zoom'), ('remove', '-')]:
-            k = nuke.PyScript_Knob('favrow%d_%s' % (i, suffix), label)
-            k.setCommand(FAV_CMD)
-            if suffix != 'open':
-                k.clearFlag(nuke.STARTLINE)
-            hub.addKnob(k)
-        hub.addKnob(nuke.Text_Knob('favrow%d_div' % i, ''))
-
-
-def fav_refresh():
-    fav_rebuild(nuke.thisNode())
-
-
-def all_hubs():
-    return [x for x in nuke.allNodes() if 'isFavHub' in x.knobs()]
 
 
 def _fav_file():
@@ -515,21 +443,12 @@ def fav_save(names):
 
 
 def fav_entries():
-    # (None, name, node) for every favourite that exists in the open script.
-    # Wired favourites on any Favourites node are listed too.
+    # (name, node) for every saved favourite that exists in the open script.
     out = []
-    seen = set()
     for name in fav_names():
         node = nuke.toNode(name)
         if node is not None:
-            out.append((None, name, node))
-            seen.add(node.fullName())
-    for h in all_hubs():
-        for i in range(h.inputs()):
-            f = h.input(i)
-            if f is not None and f.fullName() not in seen:
-                out.append((h, i, f))
-                seen.add(f.fullName())
+            out.append((name, node))
     return out
 
 
@@ -545,55 +464,6 @@ def selected_nodes_safe():
         except Exception:
             pass
     return sel
-
-
-def add_favourites(hub, nodes):
-    # Wires each node into the first free slot. Returns the names Nuke refused.
-    existing = [hub.input(i).fullName() for i in range(hub.inputs()) if hub.input(i) is not None]
-    failed = []
-    for x in nodes:
-        if x.fullName() in existing:
-            continue
-        slot = next((i for i in range(hub.inputs()) if hub.input(i) is None), hub.inputs())
-        hub.setInput(slot, x)
-        if hub.input(slot) is None:
-            failed.append(x.name())
-        else:
-            existing.append(x.fullName())
-    return failed
-
-
-def fav_add():
-    hub = nuke.thisNode()
-    sel = [x for x in nuke.selectedNodes()
-           if x.fullName() != hub.fullName() and 'isFavHub' not in x.knobs()]
-    if not sel:
-        nuke.message('Select the nodes you want as favourites, then click again.')
-        return
-    failed = add_favourites(hub, sel)
-    fav_rebuild(hub)
-    if failed:
-        nuke.message('Nuke would not accept these as favourites:\n' + '\n'.join(failed))
-
-
-def fav_action():
-    # One handler for every row button. The knob name says which row and which action.
-    hub = nuke.thisNode()
-    row, action = nuke.thisKnob().name().split('_')
-    idx = int(row[len('favrow'):])
-    fav = hub.input(idx)
-    if fav is None:
-        nuke.message('That favourite no longer exists. Click Refresh.')
-        return
-    if action == 'open':
-        fav.showControlPanel()
-    elif action == 'connect':
-        make_node(source=fav)
-    elif action == 'zoom':
-        jump(fav)
-    elif action == 'remove':
-        hub.setInput(idx, None)
-        fav_rebuild(hub)
 
 
 _fav_panel = None
@@ -627,19 +497,19 @@ def favourites_panel():
         table.clear()
         del shown[:]
         text = search.text().lower()
-        for hub, slot, fav in fav_entries():
+        for name, fav in fav_entries():
             row = [fav.fullName(), fav.Class()]
             if text and not any(text in cell.lower() for cell in row):
                 continue
             table.addTopLevelItem(QtWidgets.QTreeWidgetItem(row))
-            shown.append((hub, slot, fav))
+            shown.append((name, fav))
 
     def current():
         idx = table.indexOfTopLevelItem(table.currentItem())
         return shown[idx] if idx >= 0 else None
 
     def add(*_):
-        sel = [x for x in selected_nodes_safe() if 'isFavHub' not in x.knobs()]
+        sel = selected_nodes_safe()
         if not sel:
             nuke.message('No node selected in the Node Graph. Click a node there, then click Add Selected.')
             return
@@ -653,31 +523,25 @@ def favourites_panel():
     def open_props(*_):
         entry = current()
         if entry is not None:
-            entry[2].showControlPanel()
+            entry[1].showControlPanel()
 
     def connect(*_):
         entry = current()
         if entry is not None:
-            make_node(source=entry[2])
+            make_node(source=entry[1])
 
     def zoom(*_):
         entry = current()
         if entry is not None:
-            jump(entry[2])
+            jump(entry[1])
 
     def remove(*_):
         entry = current()
         if entry is not None:
-            if entry[0] is None:
-                fav_save([n for n in fav_names() if n != entry[1]])
-            else:
-                entry[0].setInput(entry[1], None)
-                fav_rebuild(entry[0])
+            fav_save([n for n in fav_names() if n != entry[0]])
             fill()
 
     def refresh(*_):
-        for hub in all_hubs():
-            fav_rebuild(hub)
         fill()
 
     row_buttons = QtWidgets.QHBoxLayout()
@@ -704,7 +568,6 @@ ACTIONS = [
     ('Repoint Connect nodes', repoint_all),
     ('Tidy Connect nodes', tidy),
     ('Favourites panel', favourites_panel),
-    ('Create Favourites node', make_favourites_hub),
     ('Open properties of selected Connect source', open_selected_source),
 ]
 
