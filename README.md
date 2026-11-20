@@ -12,7 +12,7 @@ sid_lens_flare.py    - Lens Flare (needs sid_lens_optics.py,
                        sid_flare_inputs.py and sid_flare_presets.py
                        next to it)
 connect_node.py      - Connect node: a live pointer to another node, with
-                       Favourites hub
+                       Favourites panel
 menu.py              - registers all of the above under Nodes > Sid
 
 Install
