@@ -133,25 +133,39 @@ def jump(target):
     nuke.zoom(nuke.zoom(), [target.xpos() + target.screenWidth() / 2, target.ypos() + target.screenHeight() / 2])
 
 
-def make_node(dummy=False, source=None):
+def unique_name(base):
+    # Next free base_1, base_2 ... Never hands out a name another node already has.
+    i = 1
+    while nuke.toNode('%s_%d' % (base, i)) is not None:
+        i += 1
+    return '%s_%d' % (base, i)
+
+
+def make_node(dummy=False, source=None, pos=None):
     # The dummy is the same node in a different colour. Point it at anything,
     # point Connect nodes at the dummy, and re-pointing the dummy moves them all.
-    sel = nuke.selectedNodes()
-    ref = source if source is not None else (sel[0] if len(sel) == 1 else None)
+    ref = source
+    if ref is None:
+        sel = nuke.selectedNodes()
+        ref = sel[0] if len(sel) == 1 else None
 
-    name = 'Connect_Node_1'
+    name = unique_name('Connect_Node')
     if dummy:
         # Cancel stops creation. An empty answer keeps the default name.
         answer = nuke.getInput('Dummy node name', 'Dummy_Node_1')
         if answer is None:
             return None
         name = answer.strip().replace(' ', '_') or 'Dummy_Node_1'
+        if nuke.toNode(name) is not None:
+            name = unique_name(name.rstrip('0123456789_') or 'Dummy_Node')
     n = nuke.nodes.NoOp(name=name)
     n['hide_input'].setValue(True)
     n['label'].setValue(LABEL.replace('Connected to', 'Dummy to') if dummy else LABEL)
     n['tile_color'].setValue(BROKEN_COLOR)
     n['note_font_size'].setValue(LABEL_SIZE)
-    if ref is not None:
+    if pos is not None:
+        n.setXYpos(pos[0], pos[1])
+    elif ref is not None:
         # Just to the right of the source (or the single selected node).
         n.setXYpos(ref.xpos() + ref.screenWidth() + 30, ref.ypos())
 
@@ -199,12 +213,28 @@ def make_node(dummy=False, source=None):
     return n
 
 
+def children_of(node):
+    return [x for x in all_connects() if x.input(0) is not None and x.input(0).fullName() == node.fullName()]
+
+
 def make_on_selected():
+    # First time on a node: a parent Connect next to it plus a child wired to the parent.
+    # Any later time on the same node (or on the parent itself): just one more child.
     sel = nuke.selectedNodes()
     if len(sel) != 1:
         nuke.message('Select exactly one node first, then try again.')
         return None
-    return make_node(source=sel[0])
+    src = sel[0]
+    if 'connectNode' in src.knobs():
+        parent = src
+    else:
+        parents = [x for x in children_of(src) if not is_dummy(x)]
+        parent = parents[0] if parents else make_node(source=src)
+    if parent is None:
+        return None
+    count = len(children_of(parent))
+    child = make_node(source=parent, pos=(parent.xpos(), parent.ypos() + 80 + 60 * count))
+    return child
 
 
 _panel = None
